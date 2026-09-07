@@ -2,7 +2,8 @@
 
 Uses the existing planning/model logic but fixes validation ordering so an invalid
 model suggestion can never make an existing Garmin workout disappear from the
-preview. Also applies simple athlete schedule constraints after validation.
+preview. It also applies athlete schedule constraints and adds athlete-facing plan
+identity/focus labels (for example ThyTrailW3D4).
 """
 
 from __future__ import annotations
@@ -11,11 +12,55 @@ import datetime as dt
 from typing import Any
 
 import coach_preview as base
+from plan_identity import position_for
 from plan_matcher import kind_from_text
+
+FOCUS_LABELS = {
+    "easy_run": "Rolig aerob træning og kontinuitet",
+    "easy": "Rolig aerob træning og kontinuitet",
+    "trail_easy": "Rolig trail, teknik og sikkert fodarbejde",
+    "trail": "Trailteknik og terræntilvænning",
+    "quality_interval": "Bakkestyrke, løbeøkonomi og kontrolleret kvalitet",
+    "quality_tempo": "Kontrolleret tempo og udholdenhed ved højere indsats",
+    "long_trail": "Tid på benene, trailspecificitet og energiindtag",
+    "back_to_back": "Løb på trætte ben og robusthed til næste løbsdag",
+    "strength_master": "Benstyrke, stabilitet og hoftemobilitet",
+    "strength": "Benstyrke, stabilitet og hoftemobilitet",
+    "recovery_cross_training": "Aktiv restitution uden ekstra løbebelastning",
+    "shakeout": "Let gennemløb og friske ben",
+    "unknown": "Dagens planlagte træningsformål",
+}
 
 
 def date_of(value: Any) -> dt.date | None:
     return base.date_of(value)
+
+
+def inferred_family(action: dict[str, Any]) -> str:
+    if action.get("family"):
+        return str(action["family"])
+    return kind_from_text(action.get("source_title"))
+
+
+def focus_for(action: dict[str, Any]) -> str:
+    family = inferred_family(action)
+    return FOCUS_LABELS.get(family, FOCUS_LABELS["unknown"])
+
+
+def decorate(actions: list[dict[str, Any]], context: dict[str, Any]) -> None:
+    profile = context.get("athlete_preferences") or {}
+    event = context.get("event") or {}
+    for action in actions:
+        try:
+            pos = position_for(action["date"], profile, event)
+            action["plan_name"] = pos["name"]
+            action["plan_week"] = pos["week"]
+            action["plan_day"] = pos["day"]
+        except Exception:
+            action["plan_name"] = None
+        action["focus"] = focus_for(action)
+        chosen = action.get("selected_template") or {}
+        action["workout_style"] = chosen.get("title") or action.get("source_title") or inferred_family(action)
 
 
 def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, Any]) -> dict[str, Any]:
@@ -110,10 +155,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
         is_hard = family in base.HARD_FAMILIES or action.get("intensity") == "hard"
         d = date_of(action["date"])
         if is_hard and d:
-            conflict = any(
-                date_of(other) and abs((d - date_of(other)).days) == 1
-                for other in hard_dates
-            )
+            conflict = any(date_of(other) and abs((d - date_of(other)).days) == 1 for other in hard_dates)
             if conflict and action["action"] in {"ADD", "ADJUST"}:
                 continue
             hard_dates.add(action["date"])
@@ -127,10 +169,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
     except Exception:
         max_run_days = None
     if max_run_days:
-        run_dates = {
-            str(i.get("date")) for i in existing
-            if kind_from_text(i.get("title")) != "strength"
-        }
+        run_dates = {str(i.get("date")) for i in existing if kind_from_text(i.get("title")) != "strength"}
         filtered: list[dict[str, Any]] = []
         for action in final_actions:
             family = action.get("family")
@@ -154,6 +193,8 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
                 "step_count": chosen.get("step_count"),
                 "distance_hint_km": chosen.get("distance_hint_km"),
             }
+
+    decorate(final_actions, context)
 
     return {
         "generated_at": dt.datetime.now().astimezone().isoformat(),
