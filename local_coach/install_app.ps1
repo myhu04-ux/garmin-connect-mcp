@@ -33,7 +33,6 @@ try {
 }
 
 Write-Host "`n4/5 Genstarter coach-UI sikkert..." -ForegroundColor Cyan
-# Stop only Python processes whose command line explicitly contains this coach UI.
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine -like '*local_coach*coach_ui.py*' } |
@@ -41,16 +40,36 @@ try {
 } catch {
     Write-Host "ADVARSEL: Kunne ikke stoppe gammel UI automatisk: $($_.Exception.Message)" -ForegroundColor Yellow
 }
-Start-Sleep -Milliseconds 700
+Start-Sleep -Milliseconds 800
 $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
 Start-Process -FilePath $uiPython -ArgumentList @($ui, '--no-browser') -WindowStyle Hidden
-Start-Sleep -Seconds 2
 
-Write-Host "`n5/5 Åbner UI. UI'et ejer nu den første Garmin-opdatering..." -ForegroundColor Cyan
+# Wait briefly for localhost to answer before requesting the first visible job.
+$ready = $false
+for ($i = 0; $i -lt 15; $i++) {
+    Start-Sleep -Milliseconds 500
+    try {
+        Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -Method Get -TimeoutSec 2 | Out-Null
+        $ready = $true
+        break
+    } catch {}
+}
+if (-not $ready) { throw 'Coach-UI startede ikke på http://127.0.0.1:8765/' }
+
+Write-Host "`n5/5 Starter frisk Garmin-opdatering gennem UI'et..." -ForegroundColor Cyan
+try {
+    $body = @{ kind = 'status'; text = '' } | ConvertTo-Json -Compress
+    Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/run' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5 | Out-Null
+    Write-Host 'Garmin-opdatering er startet og kan følges i browseren.' -ForegroundColor Green
+} catch {
+    # 409 simply means the UI already started its own initial refresh; either way
+    # there is one visible job and the process mutex prevents double Garmin calls.
+    Write-Host 'UI har allerede startet/opfanget coach-opdateringen. Fortsætter.' -ForegroundColor Yellow
+}
 Start-Process 'http://127.0.0.1:8765/'
 
 Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'UI: http://127.0.0.1:8765/'
-Write-Host 'Den første Garmin-opdatering starter inde i UI-processen, så status og fejl kan ses i browseren.'
+Write-Host 'Den friske Garmin-kørsel ejes af UI-processen, så status og fejl kan ses i browseren.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
 Write-Host 'Garmin write-back er fortsat OFF indtil én kalenderændring er testet fra UI.' -ForegroundColor Yellow
