@@ -1,0 +1,16 @@
+library_dir: ./data
+max_episodes_per_feed: 3
+max_total_ready_hours: 6
+
+sources:
+  - name: Genstart
+    enabled: true
+    feed: https://api.dr.dk/podcasts/v1/feeds/genstart.xml?format=podcast
+  - name: Tyran
+    enabled: true
+    feed: https://api.dr.dk/podcasts/v1/feeds/tyran.xml?format=podcast
+
+sync:
+  # Set this later to the Garmin Music folder when the watch is mounted/mapped.
+  target_dir: ""
+  delete_target_before_sync: false
