@@ -4,8 +4,9 @@ READ ONLY. The matcher behaves like a coach rather than a strict calendar:
 - same day is ideal
 - +/-1 day is normally acceptable when session type/load fit
 - +/-2 days can count only with strong evidence
-- strength is matched against strength activities, not marked as a false miss
+- strength is matched against strength activities
 - ambiguous matches remain uncertain instead of being forced
+- an unmatched workout scheduled for today is PENDING, not prematurely missed
 """
 
 from __future__ import annotations
@@ -143,7 +144,6 @@ def candidate_score(item: dict[str, Any], activity: dict[str, Any]) -> tuple[flo
             score -= 4.0
             reasons.append("anden træningstype")
 
-    # Distance is a strong clue for running, but deliberately ignored for strength.
     if pk != "strength":
         low, high = extract_km_target(str(item.get("title") or ""))
         actual_km = km_of_activity(activity)
@@ -182,10 +182,7 @@ def match_recent_plan(
     today = dt.date.today()
     start = today - dt.timedelta(days=days_back - 1)
 
-    planned = [
-        item for item in calendar.get("items", [])
-        if planned_date(item) and start <= planned_date(item) <= today
-    ]
+    planned = [item for item in calendar.get("items", []) if planned_date(item) and start <= planned_date(item) <= today]
     activities = [
         a for a in (snapshot.get("all_activities") or snapshot.get("running_activities") or [])
         if activity_date(a) and start - dt.timedelta(days=2) <= activity_date(a) <= today
@@ -195,6 +192,7 @@ def match_recent_plan(
     matches: list[dict[str, Any]] = []
     misses: list[dict[str, Any]] = []
     uncertain: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
 
     for item in sorted(planned, key=lambda x: x.get("date") or ""):
         candidates: list[tuple[float, dict[str, Any], list[str]]] = []
@@ -207,19 +205,21 @@ def match_recent_plan(
                 candidates.append((score, activity, reasons))
         candidates.sort(key=lambda x: x[0], reverse=True)
 
+        pd = planned_date(item)
         if not candidates:
-            misses.append({"planned_date": item.get("date"), "planned_title": item.get("title")})
+            target = {"planned_date": item.get("date"), "planned_title": item.get("title")}
+            (pending if pd == today else misses).append(target)
             continue
 
         best_score, activity, reasons = candidates[0]
-        pd = planned_date(item)
         ad = activity_date(activity)
         delta = (ad - pd).days if pd and ad else 0
         required = 8.0 if abs(delta) == 2 else min_score
         second = candidates[1][0] if len(candidates) > 1 else -999
 
         if best_score < required:
-            misses.append({"planned_date": item.get("date"), "planned_title": item.get("title")})
+            target = {"planned_date": item.get("date"), "planned_title": item.get("title")}
+            (pending if pd == today else misses).append(target)
             continue
         if second > -900 and best_score - second < 1.5 and str(activity.get("workout_id") or "") != str(item.get("workout_id") or ""):
             uncertain.append({
@@ -247,12 +247,18 @@ def match_recent_plan(
             "reasons": reasons,
         })
 
+    # Denominator is workouts whose status is actually due/decidable. Pending today
+    # is shown separately and does not make adherence look worse prematurely.
+    due = len(matches) + len(misses) + len(uncertain)
     return {
-        "planned_workouts": len(planned),
+        "planned_workouts": due,
+        "calendar_workouts_in_window": len(planned),
         "matched": len(matches),
         "missed": len(misses),
         "uncertain": len(uncertain),
+        "pending": len(pending),
         "matches": matches,
         "misses": misses,
         "uncertain_matches": uncertain,
+        "pending_today": pending,
     }
