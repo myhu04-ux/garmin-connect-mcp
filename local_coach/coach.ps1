@@ -60,7 +60,6 @@ function Ensure-Templates([switch]$Force) {
 }
 
 function Build-CoachOutput {
-    # Facts first, then one validated plan, final integrity guard, then one athlete-facing language pass.
     Run-CoachScript 'coach_brief_v2.py' -Required
     Run-CoachScript 'coach_preview_v2.py' -Required
     Run-CoachScript 'preview_integrity.py' -Required
@@ -75,6 +74,7 @@ function Run-Status([switch]$RefreshTemplates) {
     Write-Host "==============================================" -ForegroundColor Green
 
     Run-CoachScript 'profile_defaults.py' -Required
+    Run-CoachScript 'sync_goal_profile.py' -Required
     Run-CoachScript 'coach_doctor.py' @('--mode','preflight') -Required
     Run-CoachScript 'collect_snapshot.py' @('--days','42') -Required
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
