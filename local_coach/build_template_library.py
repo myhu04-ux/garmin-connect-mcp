@@ -1,9 +1,7 @@
-r"""Build an approved local workout-template library from the athlete's existing Garmin workouts.
+r"""Build an approved local workout-template library from existing Garmin workouts.
 
-This is READ ONLY with respect to Garmin. It reads the local output from
-workout_style_probe.py and classifies known, already working workouts into
-approved template families. The resulting library is later used by the coach
-instead of letting the language model invent workout structure from scratch.
+READ ONLY with respect to Garmin. Known working workouts become immutable source
+styles for later planning; strength is pinned to the athlete's known-good master.
 """
 
 from __future__ import annotations
@@ -24,11 +22,8 @@ def norm(text: str | None) -> str:
 def classify(title: str | None, sport: str | None) -> str | None:
     t = norm(title)
     s = norm(sport)
-
-    # Strength is deliberately pinned to the known-good existing home workout.
     if "styrke" in t and ("benpower" in t or "hoftemobilitet" in t):
         return "strength_master"
-
     if s == "running":
         if "back-to-back" in t:
             return "back_to_back"
@@ -44,10 +39,8 @@ def classify(title: str | None, sport: str | None) -> str | None:
             return "shakeout"
         if "let løb" in t or "let loeb" in t:
             return "easy_run"
-
     if s == "cycling" and ("restitution" in t or "let cykling" in t):
         return "recovery_cross_training"
-
     return None
 
 
@@ -71,7 +64,6 @@ def main() -> int:
 
     raw = json.loads(SOURCE.read_text(encoding="utf-8"))
     details = raw.get("details") or []
-
     families: dict[str, list[dict[str, Any]]] = {}
     unclassified: list[dict[str, Any]] = []
 
@@ -85,6 +77,7 @@ def main() -> int:
             "title": item.get("title"),
             "sport": item.get("sport"),
             "step_count": len(item.get("steps") or []),
+            "estimated_duration_s": item.get("estimated_duration_s"),
             "distance_hint_km": {"low": low_km, "high": high_km},
             "steps": item.get("steps") or [],
             "raw": item.get("raw"),
@@ -94,8 +87,6 @@ def main() -> int:
         else:
             unclassified.append(compact)
 
-    # Sort variable-distance families by their title distance, making nearest-template
-    # selection deterministic later.
     for rows in families.values():
         rows.sort(key=lambda r: (
             r["distance_hint_km"].get("low") if r["distance_hint_km"].get("low") is not None else 9999,
@@ -134,7 +125,9 @@ def main() -> int:
     for name in sorted(families):
         print(f"{name}: {len(families[name])}")
         for item in families[name]:
-            print(f"  - {item.get('title')} | workout={item.get('workout_id')} | trin={item.get('step_count')}")
+            duration = item.get("estimated_duration_s")
+            duration_text = f" | ca. {round(float(duration)/60)} min" if duration else ""
+            print(f"  - {item.get('title')} | workout={item.get('workout_id')} | trin={item.get('step_count')}{duration_text}")
     print(f"Uklassificerede: {len(unclassified)}")
     strength = families.get("strength_master") or []
     if strength:
