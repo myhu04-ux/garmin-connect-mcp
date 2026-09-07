@@ -90,8 +90,10 @@ def compact_activities(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]
     output: list[dict[str, Any]] = []
     for a in rows or []:
         activity_type = a.get("activityType") or {}
+        workout_id = a.get("workoutId") or a.get("workoutID") or a.get("activityWorkoutId")
         result = {
             "id": a.get("activityId"),
+            "workout_id": workout_id,
             "name": a.get("activityName"),
             "type": activity_type.get("typeKey") if isinstance(activity_type, dict) else activity_type,
             "subtype": _subtype(a),
@@ -180,7 +182,6 @@ def main() -> int:
         errors,
     )
     if all_raw is None:
-        # Backward-compatible fallback for an older client/API behavior.
         all_raw = safe_call(
             "running_activities_fallback",
             lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat(), "running"),
