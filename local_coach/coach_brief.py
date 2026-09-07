@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from plan_matcher import match_recent_plan
+
 SNAPSHOT = Path(r"C:\GarminCoach\data\snapshot.json")
 CALENDAR = Path(r"C:\GarminCoach\data\scheduled_workouts.json")
 TEMPLATES = Path(r"C:\GarminCoach\data\approved_workout_templates.json")
@@ -107,6 +109,40 @@ def health_section(snapshot: dict[str, Any], history: dict[str, Any]) -> list[st
     return lines
 
 
+def plan_match_section(snapshot: dict[str, Any], calendar: dict[str, Any]) -> list[str]:
+    result = match_recent_plan(snapshot, calendar, days_back=8)
+    planned = result.get("planned_running_workouts", 0)
+    matched = result.get("matched", 0)
+    lines: list[str] = []
+
+    if planned == 0:
+        return ["- Ingen planlagte løbeworkouts fundet i de seneste 8 dage at sammenligne med."]
+
+    lines.append(f"- Plan vs. gennemført, seneste 8 dage: {matched}/{planned} planlagte løb er matchet.")
+
+    for m in result.get("matches", []):
+        shift = int(m.get("date_shift_days") or 0)
+        if shift == 0:
+            timing = "samme dag"
+        elif shift == 1:
+            timing = "1 dag senere"
+        elif shift == -1:
+            timing = "1 dag tidligere"
+        else:
+            timing = f"{shift:+d} dage"
+        lines.append(
+            f"  ✓ {m.get('planned_date')}: {m.get('planned_title') or 'planlagt pas'} -> "
+            f"{m.get('completed_date')} ({timing}), {m.get('completed_km')} km"
+        )
+
+    for miss in result.get("misses", [])[:4]:
+        lines.append(
+            f"  ? {miss.get('planned_date')}: {miss.get('planned_title') or 'planlagt pas'} - intet sikkert match fundet"
+        )
+
+    return lines
+
+
 def main() -> int:
     snapshot = load(SNAPSHOT, {})
     calendar = load(CALENDAR, {})
@@ -128,7 +164,7 @@ def main() -> int:
     lines = [
         "=== COACH-RESUMÉ ===",
         "",
-        "HELbred / RESTITUTION",
+        "HELBRED / RESTITUTION",
         *health_section(snapshot, history),
         "",
         "TRÆNING PÅ SPORET",
@@ -138,6 +174,8 @@ def main() -> int:
         lines.append(f"- Højdemeter seneste 7 dage: ca. {stats['elevation_m']} m.")
     if stats.get("load") is not None:
         lines.append(f"- Registreret Garmin-træningsbelastning: {stats['load']}.")
+
+    lines.extend(plan_match_section(snapshot, calendar))
 
     if future:
         lines.append(f"- Planlagte Garmin-workouts næste 10 dage: {len(future)}.")
@@ -157,6 +195,8 @@ def main() -> int:
     lines.extend([
         "",
         "STATUS",
+        "- Match af plan vs. gennemført accepterer op til ±1 dags forskydning, hvis træningstype og belastning passer.",
+        "- Styrkepas indgår endnu ikke i denne matchning, fordi det nuværende snapshot kun henter løbeaktiviteter.",
         "- Dette er et trænings-/restitutionsresumé, ikke en medicinsk vurdering.",
         "- Garmin write-back: OFF.",
     ])
