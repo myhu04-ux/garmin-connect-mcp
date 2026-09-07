@@ -1,8 +1,9 @@
 """Final integrity pass for the validated 7-day preview.
 
 No model calls and no Garmin writes. Every existing calendar workout in the preview
-horizon must be represented by a final KEEP/MOVE/ADJUST/REMOVE decision. This
-catches actions that were valid early but later filtered by another safety rule.
+horizon must be represented by a final KEEP/MOVE/ADJUST/REMOVE decision. After any
+restoration, plan names are recalculated for the whole week so double-session R/S
+suffixes remain unique.
 """
 
 from __future__ import annotations
@@ -80,14 +81,16 @@ def main() -> int:
             "evidence_tags": [],
         })
 
-    if restored:
-        context = {
-            "athlete_preferences": profile,
-            "event": state.get("event") or {},
-        }
-        decorate(restored, context)
-        actions.extend(restored)
-        actions.sort(key=lambda a: (str(a.get("date") or ""), str(a.get("plan_name") or "")))
+    actions.extend(restored)
+
+    # Re-decorate the complete final set. This matters if a restored strength
+    # session shares a day with a run; both then receive unique R/S plan names.
+    context = {
+        "athlete_preferences": profile,
+        "event": state.get("event") or {},
+    }
+    decorate(actions, context)
+    actions.sort(key=lambda a: (str(a.get("date") or ""), str(a.get("plan_name") or "")))
 
     preview["actions"] = actions
     preview["integrity"] = {
@@ -101,7 +104,7 @@ def main() -> int:
     print("=== PREVIEW INTEGRITY ===")
     print(f"Eksisterende Garmin-pas i horisont: {len(existing)}")
     print(f"Genindsat som KEEP: {len(restored)}")
-    print("Alle eksisterende pas kan spores i slutpreviewet.")
+    print("Alle eksisterende pas kan spores, og plan-navne er genberegnet samlet.")
     return 0
 
 
