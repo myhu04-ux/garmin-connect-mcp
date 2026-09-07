@@ -60,9 +60,10 @@ function Ensure-Templates([switch]$Force) {
 }
 
 function Build-CoachOutput {
-    # Facts first, then one validated plan, then one athlete-facing language pass.
+    # Facts first, then one validated plan, final integrity guard, then one athlete-facing language pass.
     Run-CoachScript 'coach_brief_v2.py' -Required
     Run-CoachScript 'coach_preview_v2.py' -Required
+    Run-CoachScript 'preview_integrity.py' -Required
     Run-CoachScript 'coach_voice.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
 }
@@ -94,8 +95,6 @@ function Run-Status([switch]$RefreshTemplates) {
 function Run-Auto {
     Run-Status
     Run-CoachScript 'calendar_writer.py' @('--apply') -Required
-    # If a real write happened, re-read Garmin and rebuild both preview and language
-    # from the new calendar truth before the UI sees the result.
     Run-CoachScript 'calendar_probe.py' -Required
     Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
