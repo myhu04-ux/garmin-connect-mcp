@@ -1,9 +1,9 @@
 """Collect and cache personal recovery history from Garmin Connect.
 
-READ ONLY. The cache lets the coach compare the latest days with the athlete's
-own baseline instead of generic thresholds. Existing days are reused, so later
-runs only fetch missing/recent data. Partial progress is saved if Garmin limits
-requests.
+READ ONLY. The cache lets the coach compare recent recovery with the athlete's
+own baseline. To avoid Garmin rate limits, recent missing days are prioritized
+and each run has a hard cap on per-day API calls. Older history fills in over
+subsequent scheduled runs.
 """
 
 from __future__ import annotations
@@ -131,8 +131,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--token-dir", default=os.path.expanduser("~/.garminconnect"))
     parser.add_argument("--days", type=int, default=28)
-    parser.add_argument("--refresh-days", type=int, default=3, help="Always refresh newest N days")
-    parser.add_argument("--delay", type=float, default=0.15, help="Small delay between daily calls")
+    parser.add_argument("--refresh-days", type=int, default=3)
+    parser.add_argument("--max-daily-calls", type=int, default=24, help="Hard cap for stats/sleep calls per run")
+    parser.add_argument("--delay", type=float, default=0.20)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
@@ -155,7 +156,7 @@ def main() -> int:
     garmin.login(token_dir)
     errors: list[dict[str, str]] = []
 
-    # Efficient range calls first.
+    # Range calls are efficient and populate much of HRV/Body Battery in two requests.
     try:
         merge_hrv(store, garmin.get_hrv_data_range(start.isoformat(), today.isoformat()))
     except Exception as exc:
@@ -167,33 +168,45 @@ def main() -> int:
         errors.append({"call": "body_battery_range", "error": str(exc)[:400]})
         print(f"WARNING: Body Battery range failed: {exc}")
 
-    cursor = start
-    fetched = 0
-    while cursor <= today:
-        key = cursor.isoformat()
+    # Newest dates first: a first run gets a useful recent baseline quickly.
+    dates: list[dt.date] = []
+    cursor = today
+    while cursor >= start:
+        dates.append(cursor)
+        cursor -= dt.timedelta(days=1)
+
+    calls = 0
+    rate_limited = False
+    for day in dates:
+        if calls >= max(1, args.max_daily_calls):
+            break
+        key = day.isoformat()
         existing = store.get(key, {})
-        must_refresh = cursor >= refresh_start
+        must_refresh = day >= refresh_start
         need_stats = must_refresh or existing.get("resting_hr") is None or existing.get("avg_stress") is None
         need_sleep = must_refresh or existing.get("sleep_hours") is None or existing.get("sleep_score") is None
+        if not need_stats and not need_sleep:
+            continue
 
-        try:
-            if need_stats:
-                merge(store, key, compact_stats(garmin.get_stats(key), key))
-                fetched += 1
+        for name, needed, fn, compact in [
+            ("stats", need_stats, lambda d=key: garmin.get_stats(d), compact_stats),
+            ("sleep", need_sleep, lambda d=key: garmin.get_sleep_data(d), compact_sleep),
+        ]:
+            if not needed or calls >= max(1, args.max_daily_calls):
+                continue
+            try:
+                merge(store, key, compact(fn(), key))
+                calls += 1
                 time.sleep(max(0.0, args.delay))
-            if need_sleep:
-                merge(store, key, compact_sleep(garmin.get_sleep_data(key), key))
-                fetched += 1
-                time.sleep(max(0.0, args.delay))
-        except Exception as exc:
-            text = str(exc)
-            errors.append({"date": key, "error": text[:400]})
-            print(f"WARNING: health backfill stopped at {key}: {text}")
-            save(args.output, store, start, today, errors)
-            if "429" in text or "Too Many" in text or "rate" in text.lower():
-                print("Rate limit detected. Partial history was saved; next run will resume from cache.")
-                break
-        cursor += dt.timedelta(days=1)
+            except Exception as exc:
+                text = str(exc)
+                errors.append({"date": key, "call": name, "error": text[:400]})
+                print(f"WARNING: {name} failed for {key}: {text}")
+                if "429" in text or "Too Many" in text or "rate" in text.lower():
+                    rate_limited = True
+                    break
+        if rate_limited:
+            break
 
     save(args.output, store, start, today, errors)
     rows = [r for r in store.values() if start.isoformat() <= str(r.get("date")) <= today.isoformat()]
@@ -202,9 +215,13 @@ def main() -> int:
     complete_rhr = sum(1 for r in rows if r.get("resting_hr") is not None)
 
     print("=== PERSONLIG RESTITUTIONSHISTORIK ===")
-    print(f"Dage i cache: {len(rows)}")
+    print(f"Dage i cache: {len(rows)} / mål {max(7, args.days)}")
     print(f"Søvn-dage: {complete_sleep} | HRV-dage: {complete_hrv} | hvilepuls-dage: {complete_rhr}")
-    print(f"Nye/refresh API-kald: {fetched}")
+    print(f"Daglige API-kald denne kørsel: {calls} / maks {max(1, args.max_daily_calls)}")
+    if rate_limited:
+        print("Garmin rate limit registreret. Delresultatet er gemt; næste kørsel fortsætter fra cache.")
+    elif complete_sleep < max(7, args.days) or complete_rhr < max(7, args.days):
+        print("Historikken fyldes gradvist op på kommende coach-kørsler for at skåne Garmin API'et.")
     print(f"Fejl denne kørsel: {len(errors)}")
     print(f"Gemt lokalt: {args.output}")
     print("Intet blev skrevet eller ændret i Garmin.")
