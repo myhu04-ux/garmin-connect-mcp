@@ -1,6 +1,6 @@
 param(
     [Parameter(Position=0)]
-    [ValidateSet('status','auto','goal','plan','full','update','open','test-writeback')]
+    [ValidateSet('status','auto','goal','plan','full','update','open','test-writeback','doctor')]
     [string]$Command = 'status',
 
     [Parameter(Position=1, ValueFromRemainingArguments=$true)]
@@ -38,7 +38,7 @@ function Run-CoachScript([string]$Name, [string[]]$Arguments = @(), [switch]$Req
     if ($code -ne 0) {
         $msg = "$Name sluttede med kode $code"
         if ($Required) { throw $msg }
-        Write-Host "ADVARSEL: $msg. Pipeline fortsætter med de data, der allerede findes." -ForegroundColor Yellow
+        Write-Host "ADVARSEL: $msg. Pipeline fortsætter kun, fordi dette trin er valgfrit." -ForegroundColor Yellow
     }
 }
 
@@ -65,20 +65,32 @@ function Run-Status([switch]$RefreshTemplates) {
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
     Write-Host "==============================================" -ForegroundColor Green
 
-    Run-CoachScript 'collect_snapshot.py' @('--days','42')
-    if (-not (Test-Path (Join-Path $data 'snapshot.json'))) {
-        throw 'Der findes ingen Garmin snapshot at arbejde videre med.'
-    }
+    # Fail early if the local prerequisites are not trustworthy.
+    Run-CoachScript 'coach_doctor.py' @('--mode','preflight') -Required
 
-    Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3')
-    Run-CoachScript 'calendar_probe.py'
+    # Core data must be fresh. We never continue on an old snapshot when Garmin
+    # login/activity retrieval failed.
+    Run-CoachScript 'collect_snapshot.py' @('--days','42') -Required
+
+    # Recovery history is useful but fills gradually to avoid Garmin rate limits.
+    Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
+
+    # Calendar truth is core to plan-vs-completed matching and later write-back.
+    Run-CoachScript 'calendar_probe.py' -Required
     Ensure-Templates -Force:$RefreshTemplates
+
+    # Structured analysis first, then a coach-language pass, then the validated plan.
     Run-CoachScript 'coach_brief.py' -Required
-    Run-CoachScript 'coach_preview.py' -Required
+    Run-CoachScript 'coach_voice.py' -Required
+    Run-CoachScript 'coach_preview_v2.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
+
+    # Postflight catches stale/missing artefacts before the UI trusts them.
+    Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 
     Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
     Write-Host "Dashboard: $dashboard"
+    Write-Host "Garmin-data og coach-output er valideret som friske." -ForegroundColor Green
 
     if ($OpenDashboard -and (Test-Path $dashboard)) {
         Start-Process $dashboard
@@ -86,69 +98,78 @@ function Run-Status([switch]$RefreshTemplates) {
 }
 
 function Run-Auto {
-    # Analyse first. Then the guarded writer decides whether anything is allowed.
     Run-Status
     Run-CoachScript 'calendar_writer.py' @('--apply')
-
-    # Re-read calendar after a real write so dashboard and next run share the same truth.
-    Run-CoachScript 'calendar_probe.py'
+    Run-CoachScript 'calendar_probe.py' -Required
     Run-CoachScript 'coach_brief.py' -Required
+    Run-CoachScript 'coach_voice.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
+    Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 }
 
 Ensure-Dependencies
 $query = (($Text | Where-Object { $_ -ne $null }) -join ' ').Trim()
 
-switch ($Command) {
-    'update' {
-        if (-not $git) { throw 'git.exe kunne ikke findes.' }
-        Write-Host "Opdaterer projektet fra GitHub..." -ForegroundColor Cyan
-        & $git -C $repo pull --ff-only origin feature/local-training-coach
-        if ($LASTEXITCODE -ne 0) { throw 'Git pull fejlede.' }
-        & $python -m pip install -e $repo
-        if ($LASTEXITCODE -ne 0) { throw 'Python-opdatering fejlede.' }
-        Run-Status
+# A named mutex prevents the browser UI, Windows scheduler and manual commands from
+# hitting Garmin at the same time.
+$mutex = New-Object System.Threading.Mutex($false, 'GarminLocalCoachPipeline')
+$hasLock = $false
+try {
+    $hasLock = $mutex.WaitOne(0)
+    if (-not $hasLock) {
+        Write-Host 'Coachen kører allerede i en anden proces. Denne kørsel stopper uden at kontakte Garmin.' -ForegroundColor Yellow
+        exit 9
     }
-    'goal' {
-        if (-not $query) {
-            $query = Read-Host 'Hvilket løb eller mål vil du træne mod?'
-        }
-        if (-not $query) { throw 'Der blev ikke angivet et mål.' }
-        Run-CoachScript 'event_research.py' @('--goal', $query) -Required
-        Run-Status
-    }
-    'plan' {
-        if (-not $query) {
-            $query = Read-Host 'Hvilket løbeprogram (navn eller URL) vil du bruge som inspiration?'
-        }
-        if (-not $query) { throw 'Der blev ikke angivet et program.' }
-        Run-CoachScript 'plan_research.py' @('--plan', $query) -Required
-        Run-Status
-    }
-    'full' {
-        Run-Status -RefreshTemplates
-    }
-    'auto' {
-        Run-Auto
-    }
-    'test-writeback' {
-        # Always refresh first so the test is based on the newest calendar and analysis.
-        Run-Status
-        Run-CoachScript 'calendar_writer.py' @('--test-one') -Required
-        Run-CoachScript 'calendar_probe.py'
-        Run-CoachScript 'coach_brief.py' -Required
-        Run-CoachScript 'coach_dashboard.py' -Required
-    }
-    'open' {
-        if (Test-Path $dashboard) {
-            Start-Process $dashboard
-        } else {
-            Write-Host 'Dashboard findes ikke endnu. Kører status først.' -ForegroundColor Yellow
-            $OpenDashboard = $true
+
+    switch ($Command) {
+        'update' {
+            if (-not $git) { throw 'git.exe kunne ikke findes.' }
+            Write-Host "Opdaterer projektet fra GitHub..." -ForegroundColor Cyan
+            & $git -C $repo pull --ff-only origin feature/local-training-coach
+            if ($LASTEXITCODE -ne 0) { throw 'Git pull fejlede.' }
+            & $python -m pip install -e $repo
+            if ($LASTEXITCODE -ne 0) { throw 'Python-opdatering fejlede.' }
+            Run-CoachScript 'self_test.py' -Required
             Run-Status
         }
+        'goal' {
+            if (-not $query) { $query = Read-Host 'Hvilket løb eller mål vil du træne mod?' }
+            if (-not $query) { throw 'Der blev ikke angivet et mål.' }
+            Run-CoachScript 'event_research.py' @('--goal', $query) -Required
+            Run-Status
+        }
+        'plan' {
+            if (-not $query) { $query = Read-Host 'Hvilket løbeprogram (navn eller URL) vil du bruge som inspiration?' }
+            if (-not $query) { throw 'Der blev ikke angivet et program.' }
+            Run-CoachScript 'plan_research.py' @('--plan', $query) -Required
+            Run-Status
+        }
+        'full' { Run-Status -RefreshTemplates }
+        'auto' { Run-Auto }
+        'doctor' { Run-CoachScript 'coach_doctor.py' @('--mode','postflight') -Required }
+        'test-writeback' {
+            Run-Status
+            Run-CoachScript 'calendar_writer.py' @('--test-one') -Required
+            Run-CoachScript 'calendar_probe.py' -Required
+            Run-CoachScript 'coach_brief.py' -Required
+            Run-CoachScript 'coach_voice.py' -Required
+            Run-CoachScript 'coach_dashboard.py' -Required
+            Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
+        }
+        'open' {
+            if (Test-Path $dashboard) {
+                Start-Process $dashboard
+            } else {
+                $OpenDashboard = $true
+                Run-Status
+            }
+        }
+        default { Run-Status }
     }
-    default {
-        Run-Status
+}
+finally {
+    if ($hasLock) {
+        try { $mutex.ReleaseMutex() } catch {}
     }
+    $mutex.Dispose()
 }
