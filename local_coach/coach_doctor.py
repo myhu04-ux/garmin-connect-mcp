@@ -1,9 +1,8 @@
 """Local integrity checks for Garmin Local Coach.
 
-No Garmin API calls are made here. The doctor verifies that the artefacts produced
-by a coach run are present, parseable and fresh enough to trust. It also checks
-Ollama opportunistically; Ollama failure is a warning because deterministic
-fallbacks can still keep the coach read-only and conservative.
+No Garmin API calls here. The doctor verifies that artefacts are present, parseable,
+fresh and internally consistent. Ollama is advisory: deterministic fallbacks keep
+the coach safe if the model is unavailable.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ STATE = DATA / "coach_state.json"
 PREVIEW = DATA / "coach_preview.json"
 TEMPLATES = DATA / "approved_workout_templates.json"
 SETTINGS = DATA / "coach_settings.json"
+PROFILE = DATA / "athlete_profile.json"
 OUT = DATA / "system_status.json"
 OLLAMA_TAGS = "http://127.0.0.1:11434/api/tags"
 MODEL = "qwen3:1.7b"
@@ -85,14 +85,21 @@ def main() -> int:
     try:
         response = requests.get(OLLAMA_TAGS, timeout=2.5)
         response.raise_for_status()
-        tags = response.json().get("models", []) if isinstance(response.json(), dict) else []
+        body = response.json()
+        tags = body.get("models", []) if isinstance(body, dict) else []
         names = {str(x.get("name") or x.get("model") or "") for x in tags if isinstance(x, dict)}
-        if any(name == MODEL or name.startswith(MODEL + ":") for name in names) or MODEL in names:
+        if MODEL in names:
             add("ollama", "ok", f"Ollama svarer, og {MODEL} er tilgængelig.")
         else:
-            add("ollama", "warning", f"Ollama svarer, men {MODEL} blev ikke fundet. Coachen kan falde tilbage til konservativ logik.")
+            add("ollama", "warning", f"Ollama svarer, men {MODEL} blev ikke fundet. Konservativ fallback er stadig mulig.")
     except Exception as exc:
         add("ollama", "warning", f"Ollama svarer ikke lige nu: {exc}")
+
+    profile = load(PROFILE) if PROFILE.exists() else None
+    if isinstance(profile, dict) and profile.get("plan_code") and profile.get("plan_anchor_monday") and profile.get("plan_anchor_week"):
+        add("plan_identity", "ok", f"Planidentitet: {profile.get('plan_code')} med anchor-uge {profile.get('plan_anchor_week')} fra {profile.get('plan_anchor_monday')}.")
+    elif args.mode == "postflight":
+        add("plan_identity", "warning", "Planidentiteten er ufuldstændig; Garmin-navne kan mangle W/D-kode.")
 
     if args.mode == "postflight":
         required = [
@@ -129,11 +136,7 @@ def main() -> int:
         if isinstance(source_status, dict) and source_status.get("activities") != "ok":
             add("garmin_activity_source", "fatal", "Seneste snapshot blev ikke bygget på en vellykket aktivitetshentning fra Garmin.")
         elif isinstance(snapshot, dict):
-            add(
-                "garmin_activity_source",
-                "ok",
-                f"Snapshot indeholder {len(snapshot.get('all_activities') or [])} aktiviteter, heraf {len(snapshot.get('running_activities') or [])} løb.",
-            )
+            add("garmin_activity_source", "ok", f"Snapshot indeholder {len(snapshot.get('all_activities') or [])} aktiviteter, heraf {len(snapshot.get('running_activities') or [])} løb.")
 
         templates = payloads.get("templates") or {}
         families = templates.get("families") if isinstance(templates, dict) else {}
@@ -143,9 +146,27 @@ def main() -> int:
         else:
             add("strength_master", "warning", "Godkendt styrke-master blev ikke fundet i workout-biblioteket.")
 
+        preview = payloads.get("coach_preview") or {}
+        integrity = preview.get("integrity") if isinstance(preview, dict) else None
+        if not isinstance(integrity, dict) or not integrity.get("ok"):
+            add("preview_integrity", "fatal", "Slutpreviewet mangler en bestået integritetskontrol.")
+        else:
+            restored = int(integrity.get("restored_keep_actions") or 0)
+            if restored:
+                add("preview_integrity", "warning", f"Integritetsvagten genindsatte {restored} eksisterende pas som KEEP. Sikkerheden virkede, men forslagslogikken bør observeres.")
+            else:
+                add("preview_integrity", "ok", "Alle eksisterende pas var repræsenteret efter hele validator-kæden.")
+
+        actions = preview.get("actions", []) if isinstance(preview, dict) else []
+        missing_names = sum(1 for action in actions if isinstance(action, dict) and not action.get("plan_name"))
+        if missing_names:
+            add("plan_names", "warning", f"{missing_names} preview-pas mangler W/D-plan-navn.")
+        else:
+            add("plan_names", "ok", "Alle preview-pas har plan-navn.")
+
         settings = load(SETTINGS) if SETTINGS.exists() else {}
         if isinstance(settings, dict) and settings.get("garmin_writeback_enabled") and not settings.get("writeback_test_passed"):
-            add("writeback_gate", "fatal", "Write-back står ON uden bestået kalender-test. Dette er blokeret af sikkerhedsreglerne.")
+            add("writeback_gate", "fatal", "Write-back står ON uden bestået kalender-test.")
         else:
             add("writeback_gate", "ok", "Write-back gate er konsistent.")
 
