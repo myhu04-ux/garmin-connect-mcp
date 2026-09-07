@@ -1,8 +1,8 @@
 """Read-only probe for scheduled Garmin workouts.
 
 Purpose: show the local coach what is already planned in Garmin before it
-suggests any changes. This script never creates, edits, schedules, or removes
-workouts.
+suggests changes. This script never creates, edits, schedules or removes workouts.
+It fails fast on auth/rate-limit errors so the UI never appears to hang for minutes.
 """
 
 from __future__ import annotations
@@ -20,11 +20,6 @@ OUT = Path(r"C:\GarminCoach\data\scheduled_workouts.json")
 
 
 def month_pairs(start: dt.date, months_back: int = 1, months_ahead: int = 2) -> list[tuple[int, int]]:
-    """Return calendar months around today, including the previous month.
-
-    The previous month matters when a workout planned on the last day of one
-    month is completed one day later in the next month.
-    """
     first = dt.date(start.year, start.month, 1)
     pairs: list[tuple[int, int]] = []
     for offset in range(-months_back, months_ahead + 1):
@@ -61,14 +56,12 @@ def first(d: dict[str, Any], *keys: str) -> Any:
 def extract_items(raw: Any) -> list[dict[str, Any]]:
     seen: set[tuple[str, str, str]] = set()
     rows: list[dict[str, Any]] = []
-
     for d in walk_dicts(raw):
         date = first(d, "calendarDate", "date", "startDate", "scheduledDate")
         title = first(d, "workoutName", "title", "name", "itemName")
         workout_id = first(d, "workoutId", "workoutID", "id")
         scheduled_id = first(d, "scheduledWorkoutId", "scheduleId", "calendarItemId")
         item_type = first(d, "itemType", "type", "calendarItemType")
-
         if not date:
             continue
         date_text = str(date)[:10]
@@ -76,31 +69,21 @@ def extract_items(raw: Any) -> list[dict[str, Any]]:
             dt.date.fromisoformat(date_text)
         except ValueError:
             continue
-
         text_blob = json.dumps(d, ensure_ascii=False).lower()
-        looks_workout = (
-            "workout" in text_blob
-            or "training" in text_blob
-            or workout_id is not None
-            or scheduled_id is not None
-        )
+        looks_workout = "workout" in text_blob or "training" in text_blob or workout_id is not None or scheduled_id is not None
         if not looks_workout:
             continue
-
         key = (date_text, str(workout_id or ""), str(title or ""))
         if key in seen:
             continue
         seen.add(key)
-        rows.append(
-            {
-                "date": date_text,
-                "title": title,
-                "workout_id": workout_id,
-                "scheduled_workout_id": scheduled_id,
-                "item_type": item_type,
-            }
-        )
-
+        rows.append({
+            "date": date_text,
+            "title": title,
+            "workout_id": workout_id,
+            "scheduled_workout_id": scheduled_id,
+            "item_type": item_type,
+        })
     rows.sort(key=lambda x: (x.get("date") or "", str(x.get("title") or "")))
     return rows
 
@@ -110,8 +93,12 @@ def main() -> int:
         print(f"ERROR: Garmin token folder missing: {TOKEN_DIR}")
         return 2
 
-    garmin = Garmin()
-    garmin.login(TOKEN_DIR)
+    garmin = Garmin(retry_attempts=0)
+    try:
+        garmin.login(TOKEN_DIR)
+    except Exception as exc:
+        print(f"ERROR: Garmin calendar login failed: {exc}")
+        return 3
 
     today = dt.date.today()
     raw_months: dict[str, Any] = {}
@@ -123,8 +110,10 @@ def main() -> int:
             raw = garmin.get_scheduled_workouts(year, month)
         except AttributeError:
             print("ERROR: Installed garminconnect version lacks get_scheduled_workouts().")
-            print("Run: C:\\GarminCoach\\.venv\\Scripts\\python.exe -m pip install -U 'garminconnect[workout]'")
-            return 3
+            return 4
+        except Exception as exc:
+            print(f"ERROR: Garmin calendar fetch failed for {key}: {exc}")
+            return 5
         raw_months[key] = raw
         all_items.extend(extract_items(raw))
 
@@ -137,27 +126,18 @@ def main() -> int:
             unique.append(item)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(
-        json.dumps(
-            {
-                "generated_at": dt.datetime.now().astimezone().isoformat(),
-                "read_only": True,
-                "items": unique,
-                "raw_by_month": raw_months,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    OUT.write_text(json.dumps({
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "read_only": True,
+        "source_status": {"garmin_login": "ok", "calendar": "ok", "months": list(raw_months)},
+        "items": unique,
+        "raw_by_month": raw_months,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=== GARMIN CALENDAR PROBE ===")
     print(f"Scheduled workout-like items found: {len(unique)}")
     for item in unique:
-        print(
-            f"{item['date']} | {item.get('title') or '(uden titel)'} | "
-            f"workout={item.get('workout_id')} | scheduled={item.get('scheduled_workout_id')}"
-        )
+        print(f"{item['date']} | {item.get('title') or '(uden titel)'} | workout={item.get('workout_id')} | scheduled={item.get('scheduled_workout_id')}")
     print(f"Saved locally: {OUT}")
     print("No Garmin data was written or changed.")
     return 0
