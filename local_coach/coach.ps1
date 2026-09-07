@@ -65,6 +65,8 @@ function Run-Status([switch]$RefreshTemplates) {
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
     Write-Host "==============================================" -ForegroundColor Green
 
+    # Non-destructive migration keeps old profile settings while adding new plan fields.
+    Run-CoachScript 'profile_defaults.py' -Required
     Run-CoachScript 'coach_doctor.py' @('--mode','preflight') -Required
     Run-CoachScript 'collect_snapshot.py' @('--days','42') -Required
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
