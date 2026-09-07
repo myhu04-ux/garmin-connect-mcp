@@ -1,0 +1,39 @@
+{
+  "id": "thy-trail-2026-long",
+  "status": "active",
+  "name": "Thy Trail 2026 - lang distance",
+  "sport": "running",
+  "event_type": "two_day_trail_stage_race",
+  "event_dates": ["2026-10-31", "2026-11-01"],
+  "stages_km": [23, 19],
+  "total_distance_km": 42,
+  "primary_goal": "Moed velrestitueret op og gennemfoer begge etaper staerkt med overskud nok til dag 2.",
+  "terrain": [
+    "trail",
+    "forest_paths",
+    "technical_singletrack",
+    "gravel",
+    "dunes_and_heath",
+    "sand_and_beach",
+    "wind_exposure"
+  ],
+  "training_priorities": [
+    "aerobic_endurance",
+    "trail_specificity",
+    "time_on_feet",
+    "hills_and_strength",
+    "running_on_tired_legs",
+    "back_to_back_weekend_runs",
+    "technical_terrain_confidence",
+    "fueling_and_hydration_practice",
+    "recovery_between_stages",
+    "taper_before_event"
+  ],
+  "guardrails": {
+    "no_large_load_jump": true,
+    "avoid_consecutive_hard_days": true,
+    "reduce_load_when_recovery_is_poor": true,
+    "do_not_change_primary_goal_automatically": true,
+    "garmin_writeback_enabled": false
+  }
+}
