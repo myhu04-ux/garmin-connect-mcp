@@ -4,6 +4,11 @@ The snapshot is deliberately broad enough for coaching: it includes all recent
 activities (not only running), plus convenient running/strength subsets, current
 daily stats, sleep and Training Readiness when the device/account exposes it.
 Nothing is written to Garmin.
+
+A successful activity fetch is considered core data. Optional health endpoints may
+fail without invalidating the whole snapshot; those failures are recorded as
+warnings. This distinction prevents the coach from silently reusing stale data when
+Garmin login/activity retrieval actually failed.
 """
 
 from __future__ import annotations
@@ -148,7 +153,7 @@ def main() -> int:
         return 2
 
     print(f"Using local Garmin tokens from: {token_dir}")
-    garmin = Garmin()
+    garmin = Garmin(retry_attempts=0)
     try:
         garmin.login(token_dir)
     except Exception as exc:
@@ -176,17 +181,22 @@ def main() -> int:
             errors,
         )
 
+    activities_mode = "all_activities"
     all_raw = safe_call(
         "all_activities",
         lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat()),
         errors,
     )
+    core_activities_ok = all_raw is not None
     if all_raw is None:
-        all_raw = safe_call(
+        activities_mode = "running_fallback"
+        fallback_raw = safe_call(
             "running_activities_fallback",
             lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat(), "running"),
             errors,
-        ) or []
+        )
+        core_activities_ok = fallback_raw is not None
+        all_raw = fallback_raw if fallback_raw is not None else []
 
     all_activities = compact_activities(all_raw)
     running_activities = [a for a in all_activities if running_like(a)]
@@ -197,6 +207,12 @@ def main() -> int:
         "read_only": True,
         "profile_name": profile_name,
         "window": {"start": start.isoformat(), "end": today.isoformat()},
+        "source_status": {
+            "garmin_login": "ok",
+            "activities": "ok" if core_activities_ok else "failed",
+            "activities_mode": activities_mode,
+            "optional_endpoint_errors": len(errors),
+        },
         "today": compact_stats(stats),
         "sleep": compact_sleep(sleep),
         "training_readiness": compact_readiness(readiness),
@@ -212,15 +228,20 @@ def main() -> int:
 
     print("\n=== SNAPSHOT RESULT ===")
     print(f"Profile: {profile_name or 'not returned'}")
+    print(f"Activity source: {activities_mode} ({'OK' if core_activities_ok else 'FAILED'})")
     print(f"All activities: {len(all_activities)}")
     print(f"Running activities: {len(running_activities)}")
     print(f"Strength activities: {len(strength_activities)}")
     print(f"Training readiness entries: {len(snapshot['training_readiness'])}")
     print(f"Sleep data: {'yes' if snapshot['sleep'] else 'no'}")
-    print(f"Errors: {len(errors)}")
+    print(f"Optional endpoint warnings: {len(errors)}")
     print(f"Saved locally: {output}")
     print("No Garmin data was written or changed.")
-    return 0 if not errors else 1
+
+    if not core_activities_ok:
+        print("ERROR: Core activity retrieval failed. The coach must not continue on stale activity data.")
+        return 4
+    return 0
 
 
 if __name__ == "__main__":
