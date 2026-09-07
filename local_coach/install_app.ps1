@@ -8,6 +8,7 @@ $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
+$coachDir = Join-Path $repo 'local_coach'
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
 
@@ -15,15 +16,32 @@ if (-not (Test-Path $python)) { throw "Mangler Python-miljø: $python" }
 if (-not (Test-Path $coach)) { throw "Mangler coach-motor: $coach" }
 if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
 
-Write-Host "`n1/5 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
+Write-Host "`n1/6 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
 & $python -m pip install -e $repo
 if ($LASTEXITCODE -ne 0) { throw 'Python-afhængigheder kunne ikke installeres.' }
 
-Write-Host "`n2/5 Kører offline sikkerhedstests..." -ForegroundColor Cyan
-& $python $selfTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. UI genstartes ikke.' }
+Write-Host "`n2/6 Kontrollerer syntaks i hele coach-appen..." -ForegroundColor Cyan
+$pythonFiles = Get-ChildItem -Path $coachDir -Filter '*.py' -File
+foreach ($file in $pythonFiles) {
+    & $python -m py_compile $file.FullName
+    if ($LASTEXITCODE -ne 0) { throw "Python-syntaksfejl i $($file.Name). Den gamle UI stoppes ikke." }
+}
+foreach ($psFile in @($coach, $automation)) {
+    $tokens = $null
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($psFile, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    if ($parseErrors -and $parseErrors.Count -gt 0) {
+        $messages = ($parseErrors | ForEach-Object { $_.Message }) -join '; '
+        throw "PowerShell-syntaksfejl i $([IO.Path]::GetFileName($psFile)): $messages. Den gamle UI stoppes ikke."
+    }
+}
+Write-Host "Syntaks OK: $($pythonFiles.Count) Python-filer + centrale PowerShell-filer." -ForegroundColor Green
 
-Write-Host "`n3/5 Installerer automatisk coach og UI-autostart..." -ForegroundColor Cyan
+Write-Host "`n3/6 Kører offline sikkerhedstests..." -ForegroundColor Cyan
+& $python $selfTest
+if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. Den gamle UI stoppes ikke.' }
+
+Write-Host "`n4/6 Installerer automatisk coach og UI-autostart..." -ForegroundColor Cyan
 try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $automation -Days 'MON,THU,SUN' -Time '22:00' -InstallUiStartup
     if ($LASTEXITCODE -ne 0) { throw 'Scheduler returnerede fejl.' }
@@ -32,7 +50,7 @@ try {
     Write-Host 'UI kan stadig bruges; automatik kan installeres fra UI senere.' -ForegroundColor Yellow
 }
 
-Write-Host "`n4/5 Genstarter coach-UI sikkert..." -ForegroundColor Cyan
+Write-Host "`n5/6 Genstarter coach-UI sikkert..." -ForegroundColor Cyan
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine -like '*local_coach*coach_ui.py*' } |
@@ -44,7 +62,6 @@ Start-Sleep -Milliseconds 800
 $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
 Start-Process -FilePath $uiPython -ArgumentList @($ui, '--no-browser') -WindowStyle Hidden
 
-# Wait briefly for localhost to answer before requesting the first visible job.
 $ready = $false
 for ($i = 0; $i -lt 15; $i++) {
     Start-Sleep -Milliseconds 500
@@ -56,14 +73,12 @@ for ($i = 0; $i -lt 15; $i++) {
 }
 if (-not $ready) { throw 'Coach-UI startede ikke på http://127.0.0.1:8765/' }
 
-Write-Host "`n5/5 Starter frisk Garmin-opdatering gennem UI'et..." -ForegroundColor Cyan
+Write-Host "`n6/6 Starter frisk Garmin-opdatering gennem UI'et..." -ForegroundColor Cyan
 try {
     $body = @{ kind = 'status'; text = '' } | ConvertTo-Json -Compress
     Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/run' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5 | Out-Null
     Write-Host 'Garmin-opdatering er startet og kan følges i browseren.' -ForegroundColor Green
 } catch {
-    # 409 simply means the UI already started its own initial refresh; either way
-    # there is one visible job and the process mutex prevents double Garmin calls.
     Write-Host 'UI har allerede startet/opfanget coach-opdateringen. Fortsætter.' -ForegroundColor Yellow
 }
 Start-Process 'http://127.0.0.1:8765/'
