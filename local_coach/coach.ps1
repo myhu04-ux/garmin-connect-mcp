@@ -1,6 +1,6 @@
 param(
     [Parameter(Position=0)]
-    [ValidateSet('status','goal','plan','full','update','open')]
+    [ValidateSet('status','auto','goal','plan','full','update','open','test-writeback')]
     [string]$Command = 'status',
 
     [Parameter(Position=1, ValueFromRemainingArguments=$true)]
@@ -65,13 +65,11 @@ function Run-Status([switch]$RefreshTemplates) {
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
     Write-Host "==============================================" -ForegroundColor Green
 
-    # 42 days lets us compare recent load without repeatedly fetching months of activities.
     Run-CoachScript 'collect_snapshot.py' @('--days','42')
     if (-not (Test-Path (Join-Path $data 'snapshot.json'))) {
         throw 'Der findes ingen Garmin snapshot at arbejde videre med.'
     }
 
-    # Cached: first run backfills history, later runs mostly refresh recent days.
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3')
     Run-CoachScript 'calendar_probe.py'
     Ensure-Templates -Force:$RefreshTemplates
@@ -81,11 +79,21 @@ function Run-Status([switch]$RefreshTemplates) {
 
     Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
     Write-Host "Dashboard: $dashboard"
-    Write-Host "Garmin write-back er fortsat OFF." -ForegroundColor Yellow
 
     if ($OpenDashboard -and (Test-Path $dashboard)) {
         Start-Process $dashboard
     }
+}
+
+function Run-Auto {
+    # Analyse first. Then the guarded writer decides whether anything is allowed.
+    Run-Status
+    Run-CoachScript 'calendar_writer.py' @('--apply')
+
+    # Re-read calendar after a real write so dashboard and next run share the same truth.
+    Run-CoachScript 'calendar_probe.py'
+    Run-CoachScript 'coach_brief.py' -Required
+    Run-CoachScript 'coach_dashboard.py' -Required
 }
 
 Ensure-Dependencies
@@ -119,6 +127,17 @@ switch ($Command) {
     }
     'full' {
         Run-Status -RefreshTemplates
+    }
+    'auto' {
+        Run-Auto
+    }
+    'test-writeback' {
+        # Always refresh first so the test is based on the newest calendar and analysis.
+        Run-Status
+        Run-CoachScript 'calendar_writer.py' @('--test-one') -Required
+        Run-CoachScript 'calendar_probe.py'
+        Run-CoachScript 'coach_brief.py' -Required
+        Run-CoachScript 'coach_dashboard.py' -Required
     }
     'open' {
         if (Test-Path $dashboard) {
