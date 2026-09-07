@@ -1,8 +1,9 @@
-"""Lightweight local Garmin snapshot for the free local training coach.
+"""Collect a compact read-only Garmin snapshot for the local training coach.
 
-This script reads Garmin data using OAuth tokens stored only on the local PC.
-It deliberately makes a small number of API calls so initial testing is gentle
-on Garmin Connect and never writes workouts or calendar entries.
+The snapshot is deliberately broad enough for coaching: it includes all recent
+activities (not only running), plus convenient running/strength subsets, current
+daily stats, sleep and Training Readiness when the device/account exposes it.
+Nothing is written to Garmin.
 """
 
 from __future__ import annotations
@@ -40,17 +41,16 @@ def compact_sleep(raw: dict[str, Any] | None) -> dict[str, Any]:
     daily = raw.get("dailySleepDTO") or {}
     scores = daily.get("sleepScores") or {}
     overall = scores.get("overall") or {}
+    sleep_seconds = daily.get("sleepTimeSeconds")
     result = {
         "date": daily.get("calendarDate"),
-        "sleep_seconds": daily.get("sleepTimeSeconds"),
-        "sleep_hours": round(daily.get("sleepTimeSeconds", 0) / 3600, 2)
-        if daily.get("sleepTimeSeconds")
-        else None,
+        "sleep_seconds": sleep_seconds,
+        "sleep_hours": round(float(sleep_seconds) / 3600, 2) if sleep_seconds else None,
         "sleep_score": overall.get("value"),
         "sleep_quality": overall.get("qualifierKey"),
         "resting_hr": daily.get("restingHeartRate"),
         "avg_sleep_stress": daily.get("avgSleepStress"),
-        "avg_overnight_hrv": raw.get("avgOvernightHrv"),
+        "avg_overnight_hrv": raw.get("avgOvernightHrv") or daily.get("avgSleepHRV"),
         "deep_sleep_seconds": daily.get("deepSleepSeconds"),
         "rem_sleep_seconds": daily.get("remSleepSeconds"),
     }
@@ -79,6 +79,13 @@ def compact_readiness(raw: Any) -> list[dict[str, Any]]:
     return output
 
 
+def _subtype(raw: dict[str, Any]) -> str | None:
+    value = raw.get("activitySubType") or raw.get("activitySubtype")
+    if isinstance(value, dict):
+        return value.get("typeKey") or value.get("key") or value.get("name")
+    return str(value) if value not in (None, "") else None
+
+
 def compact_activities(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for a in rows or []:
@@ -86,7 +93,8 @@ def compact_activities(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]
         result = {
             "id": a.get("activityId"),
             "name": a.get("activityName"),
-            "type": activity_type.get("typeKey"),
+            "type": activity_type.get("typeKey") if isinstance(activity_type, dict) else activity_type,
+            "subtype": _subtype(a),
             "start": a.get("startTimeLocal"),
             "distance_m": a.get("distance"),
             "duration_s": a.get("duration"),
@@ -101,10 +109,20 @@ def compact_activities(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]
     return output
 
 
+def running_like(a: dict[str, Any]) -> bool:
+    text = f"{a.get('type', '')} {a.get('subtype', '')}".lower()
+    return "running" in text or "trail_run" in text
+
+
+def strength_like(a: dict[str, Any]) -> bool:
+    text = f"{a.get('type', '')} {a.get('subtype', '')} {a.get('name', '')}".lower()
+    return "strength" in text or "styrke" in text
+
+
 def safe_call(name: str, fn: Callable[[], Any], errors: list[dict[str, str]]) -> Any:
     try:
         return fn()
-    except Exception as exc:  # Keep partial snapshots useful during API hiccups.
+    except Exception as exc:
         text = str(exc)
         errors.append({"call": name, "error": text[:500]})
         print(f"WARNING: {name} failed: {text}")
@@ -114,12 +132,12 @@ def safe_call(name: str, fn: Callable[[], Any], errors: list[dict[str, str]]) ->
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--token-dir", default=os.path.expanduser("~/.garminconnect"))
-    parser.add_argument("--days", type=int, default=14)
+    parser.add_argument("--days", type=int, default=42)
     parser.add_argument("--output", default=r"C:\GarminCoach\data\snapshot.json")
     args = parser.parse_args()
 
     today = dt.date.today()
-    start = today - dt.timedelta(days=max(1, args.days))
+    start = today - dt.timedelta(days=max(1, args.days - 1))
     yesterday = today - dt.timedelta(days=1)
 
     token_dir = os.path.expanduser(args.token_dir)
@@ -140,7 +158,6 @@ def main() -> int:
     profile_name = safe_call("profile", garmin.get_full_name, errors)
     stats = safe_call("stats_today", lambda: garmin.get_stats(today.isoformat()), errors)
 
-    # Sleep sometimes appears under either the current date or previous calendar date.
     sleep = safe_call("sleep_today", lambda: garmin.get_sleep_data(today.isoformat()), errors)
     if not sleep:
         sleep = safe_call("sleep_yesterday", lambda: garmin.get_sleep_data(yesterday.isoformat()), errors)
@@ -157,11 +174,22 @@ def main() -> int:
             errors,
         )
 
-    activities = safe_call(
-        "running_activities",
-        lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat(), "running"),
+    all_raw = safe_call(
+        "all_activities",
+        lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat()),
         errors,
     )
+    if all_raw is None:
+        # Backward-compatible fallback for an older client/API behavior.
+        all_raw = safe_call(
+            "running_activities_fallback",
+            lambda: garmin.get_activities_by_date(start.isoformat(), today.isoformat(), "running"),
+            errors,
+        ) or []
+
+    all_activities = compact_activities(all_raw)
+    running_activities = [a for a in all_activities if running_like(a)]
+    strength_activities = [a for a in all_activities if strength_like(a)]
 
     snapshot = {
         "generated_at": dt.datetime.now().astimezone().isoformat(),
@@ -171,7 +199,9 @@ def main() -> int:
         "today": compact_stats(stats),
         "sleep": compact_sleep(sleep),
         "training_readiness": compact_readiness(readiness),
-        "running_activities": compact_activities(activities),
+        "all_activities": all_activities,
+        "running_activities": running_activities,
+        "strength_activities": strength_activities,
         "errors": errors,
     }
 
@@ -181,7 +211,9 @@ def main() -> int:
 
     print("\n=== SNAPSHOT RESULT ===")
     print(f"Profile: {profile_name or 'not returned'}")
-    print(f"Running activities: {len(snapshot['running_activities'])}")
+    print(f"All activities: {len(all_activities)}")
+    print(f"Running activities: {len(running_activities)}")
+    print(f"Strength activities: {len(strength_activities)}")
     print(f"Training readiness entries: {len(snapshot['training_readiness'])}")
     print(f"Sleep data: {'yes' if snapshot['sleep'] else 'no'}")
     print(f"Errors: {len(errors)}")
