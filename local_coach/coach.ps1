@@ -59,23 +59,27 @@ function Ensure-Templates([switch]$Force) {
     }
 }
 
+function Build-CoachOutput {
+    # Facts first, then one validated plan, then one athlete-facing language pass.
+    Run-CoachScript 'coach_brief_v2.py' -Required
+    Run-CoachScript 'coach_preview_v2.py' -Required
+    Run-CoachScript 'coach_voice.py' -Required
+    Run-CoachScript 'coach_dashboard.py' -Required
+}
+
 function Run-Status([switch]$RefreshTemplates) {
     Ensure-Dependencies
     Write-Host "`n==============================================" -ForegroundColor Green
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
     Write-Host "==============================================" -ForegroundColor Green
 
-    # Non-destructive migration keeps old profile settings while adding new plan fields.
     Run-CoachScript 'profile_defaults.py' -Required
     Run-CoachScript 'coach_doctor.py' @('--mode','preflight') -Required
     Run-CoachScript 'collect_snapshot.py' @('--days','42') -Required
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
     Run-CoachScript 'calendar_probe.py' -Required
     Ensure-Templates -Force:$RefreshTemplates
-    Run-CoachScript 'coach_brief.py' -Required
-    Run-CoachScript 'coach_voice.py' -Required
-    Run-CoachScript 'coach_preview_v2.py' -Required
-    Run-CoachScript 'coach_dashboard.py' -Required
+    Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 
     Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
@@ -89,19 +93,17 @@ function Run-Status([switch]$RefreshTemplates) {
 
 function Run-Auto {
     Run-Status
-    Run-CoachScript 'calendar_writer.py' @('--apply')
+    Run-CoachScript 'calendar_writer.py' @('--apply') -Required
+    # If a real write happened, re-read Garmin and rebuild both preview and language
+    # from the new calendar truth before the UI sees the result.
     Run-CoachScript 'calendar_probe.py' -Required
-    Run-CoachScript 'coach_brief.py' -Required
-    Run-CoachScript 'coach_voice.py' -Required
-    Run-CoachScript 'coach_dashboard.py' -Required
+    Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 }
 
 Ensure-Dependencies
 $query = (($Text | Where-Object { $_ -ne $null }) -join ' ').Trim()
 
-# One named mutex across UI, scheduler and manual runs. PowerShell 5.1-compatible
-# constructor syntax is used deliberately because the Acer runs Windows PowerShell 5.1.
 $mutex = New-Object System.Threading.Mutex -ArgumentList $false, 'GarminLocalCoachPipeline'
 $hasLock = $false
 try {
@@ -141,9 +143,7 @@ try {
             Run-Status
             Run-CoachScript 'calendar_writer.py' @('--test-one') -Required
             Run-CoachScript 'calendar_probe.py' -Required
-            Run-CoachScript 'coach_brief.py' -Required
-            Run-CoachScript 'coach_voice.py' -Required
-            Run-CoachScript 'coach_dashboard.py' -Required
+            Build-CoachOutput
             Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
         }
         'open' {
