@@ -1,9 +1,8 @@
 """Safer validator wrapper for coach_preview.
 
-Uses the existing planning/model logic but fixes validation ordering so an invalid
-model suggestion can never make an existing Garmin workout disappear from the
-preview. It also applies athlete schedule constraints and adds athlete-facing plan
-identity/focus labels (for example ThyTrailW3D4).
+The language model proposes coaching actions; Python owns dates, safety, athlete
+constraints, plan naming and approved Garmin templates. Today's session can be
+shown, but new/changed sessions are never written for today retroactively.
 """
 
 from __future__ import annotations
@@ -31,9 +30,22 @@ FOCUS_LABELS = {
     "unknown": "Dagens planlagte træningsformål",
 }
 
+NON_RUN_KINDS = {"strength", "recovery_cross_training", "cycling"}
+RED_DOWNGRADE = {
+    "quality_interval": "easy_run",
+    "quality_tempo": "easy_run",
+    "long_trail": "trail_easy",
+    "back_to_back": "trail_easy",
+}
+
 
 def date_of(value: Any) -> dt.date | None:
     return base.date_of(value)
+
+
+def planning_dates() -> list[str]:
+    today = dt.date.today()
+    return [(today + dt.timedelta(days=i)).isoformat() for i in range(7)]
 
 
 def inferred_family(action: dict[str, Any]) -> str:
@@ -42,9 +54,17 @@ def inferred_family(action: dict[str, Any]) -> str:
     return kind_from_text(action.get("source_title"))
 
 
+def is_run_family(family: str | None) -> bool:
+    return bool(family) and family not in NON_RUN_KINDS and family != "unknown"
+
+
+def is_run_title(title: Any) -> bool:
+    kind = kind_from_text(title)
+    return kind not in NON_RUN_KINDS
+
+
 def focus_for(action: dict[str, Any]) -> str:
-    family = inferred_family(action)
-    return FOCUS_LABELS.get(family, FOCUS_LABELS["unknown"])
+    return FOCUS_LABELS.get(inferred_family(action), FOCUS_LABELS["unknown"])
 
 
 def decorate(actions: list[dict[str, Any]], context: dict[str, Any]) -> None:
@@ -63,8 +83,24 @@ def decorate(actions: list[dict[str, Any]], context: dict[str, Any]) -> None:
         action["workout_style"] = chosen.get("title") or action.get("source_title") or inferred_family(action)
 
 
+def choose_and_bind(actions: list[dict[str, Any]], families: dict[str, list[dict[str, Any]]]) -> None:
+    for action in actions:
+        if action["action"] not in {"ADD", "ADJUST"} or not action.get("family"):
+            continue
+        chosen = base.choose_template(families, action["family"], action.get("target_km"))
+        if chosen:
+            action["selected_template"] = {
+                "workout_id": chosen.get("workout_id"),
+                "title": chosen.get("title"),
+                "step_count": chosen.get("step_count"),
+                "estimated_duration_s": chosen.get("estimated_duration_s"),
+                "distance_hint_km": chosen.get("distance_hint_km"),
+            }
+
+
 def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, Any]) -> dict[str, Any]:
     dates = set(context["allowed_dates"])
+    today = dt.date.today().isoformat()
     existing = context["existing_calendar"]
     by_workout = {str(i.get("workout_id") or ""): i for i in existing if i.get("workout_id") is not None}
     families = base.template_families(library)
@@ -94,6 +130,11 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
         if name in {"KEEP", "MOVE", "ADJUST", "REMOVE"} and source is None:
             continue
 
+        # Today's existing session can be shown/kept. New or changed target sessions
+        # are only accepted from tomorrow onward.
+        if date == today and name != "KEEP":
+            continue
+
         family = str(proposal.get("family") or "") or None
         if name in {"ADD", "ADJUST"}:
             if family not in families:
@@ -106,7 +147,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             if not sd or not nd or abs((nd - sd).days) > 2:
                 continue
 
-        # Only now is the proposal valid enough to claim/touch an existing item.
+        # Only a genuinely valid proposal may claim an existing calendar item.
         if source is not None:
             key = (str(source.get("workout_id") or ""), str(source.get("date") or ""))
             if key in touched_existing:
@@ -130,7 +171,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             "evidence_tags": tags,
         })
 
-    # Model omission or invalid suggestion means KEEP, never silent disappearance.
+    # Omitted/invalid suggestions are KEEP by default, never silent deletion.
     for item in existing:
         key = (str(item.get("workout_id") or ""), str(item.get("date") or ""))
         if key not in touched_existing:
@@ -147,33 +188,71 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
                 "evidence_tags": [],
             })
 
-    # Avoid consecutive hard changes.
+    # Deterministic red-state safety override for future key/long sessions.
+    if recovery == "red":
+        for action in validated:
+            fam = inferred_family(action)
+            if action.get("action") == "KEEP" and action.get("date") != today and fam in RED_DOWNGRADE:
+                replacement = RED_DOWNGRADE[fam]
+                if replacement in families:
+                    action["action"] = "ADJUST"
+                    action["family"] = replacement
+                    action["target_km"] = None
+                    action["intensity"] = "easy"
+                    action["reason"] = "Restitutionen er rød. Nøglebelastningen nedgraderes deterministisk til et godkendt roligt pas; kontinuitet bevares uden at jagte kvalitet."
+
+    # One running session per day unless an existing session is deliberately replaced.
+    existing_run_dates = {str(i.get("date")) for i in existing if is_run_title(i.get("title"))}
+    occupied_new_run_dates: set[str] = set()
+    one_per_day: list[dict[str, Any]] = []
+    for action in sorted(validated, key=lambda a: (a["date"], a["action"] != "KEEP")):
+        fam = inferred_family(action)
+        source_is_run = is_run_title(action.get("source_title")) if action.get("source_title") else False
+        target_is_run = is_run_family(fam)
+
+        if action["action"] == "ADD" and target_is_run:
+            if action["date"] in existing_run_dates or action["date"] in occupied_new_run_dates:
+                continue
+            occupied_new_run_dates.add(action["date"])
+        elif action["action"] == "MOVE" and source_is_run:
+            source_date = str(action.get("source_date") or "")
+            if action["date"] != source_date and action["date"] in existing_run_dates:
+                continue
+            if action["date"] in occupied_new_run_dates:
+                continue
+            occupied_new_run_dates.add(action["date"])
+        elif action["action"] == "ADJUST" and target_is_run:
+            # Replacement on the same source date is allowed; moving is not part of ADJUST.
+            occupied_new_run_dates.add(action["date"])
+        one_per_day.append(action)
+    validated = one_per_day
+
+    # Avoid consecutive hard days, including existing hard KEEP sessions.
     hard_dates: set[str] = set()
     final_actions: list[dict[str, Any]] = []
     for action in sorted(validated, key=lambda a: (a["date"], a["action"] != "KEEP")):
-        family = action.get("family")
-        is_hard = family in base.HARD_FAMILIES or action.get("intensity") == "hard"
-        d = date_of(action["date"])
-        if is_hard and d:
-            conflict = any(date_of(other) and abs((d - date_of(other)).days) == 1 for other in hard_dates)
+        fam = inferred_family(action)
+        is_hard = fam in base.HARD_FAMILIES or action.get("intensity") == "hard"
+        day = date_of(action["date"])
+        if is_hard and day:
+            conflict = any(date_of(other) and abs((day - date_of(other)).days) == 1 for other in hard_dates)
             if conflict and action["action"] in {"ADD", "ADJUST"}:
                 continue
             hard_dates.add(action["date"])
         final_actions.append(action)
 
-    # Respect a user-specified maximum number of run days for ADDs. Existing days
-    # are preserved; the validator simply refuses extra optional running additions.
+    # Respect maximum run days for optional ADDs. Existing plan is not silently cut.
     prefs = context.get("athlete_preferences") or {}
     try:
         max_run_days = int(prefs.get("max_running_days_per_week")) if prefs.get("max_running_days_per_week") is not None else None
     except Exception:
         max_run_days = None
     if max_run_days:
-        run_dates = {str(i.get("date")) for i in existing if kind_from_text(i.get("title")) != "strength"}
+        run_dates = {str(i.get("date")) for i in existing if is_run_title(i.get("title"))}
         filtered: list[dict[str, Any]] = []
         for action in final_actions:
-            family = action.get("family")
-            is_new_run = action["action"] == "ADD" and family in base.RUN_FAMILIES
+            fam = inferred_family(action)
+            is_new_run = action["action"] == "ADD" and is_run_family(fam)
             if is_new_run and action["date"] not in run_dates and len(run_dates) >= max_run_days:
                 continue
             if is_new_run:
@@ -181,18 +260,28 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             filtered.append(action)
         final_actions = filtered
 
-    # Bind every ADD/ADJUST to a real approved Garmin workout template.
-    for action in final_actions:
-        if action["action"] not in {"ADD", "ADJUST"} or not action.get("family"):
-            continue
-        chosen = base.choose_template(families, action["family"], action.get("target_km"))
-        if chosen:
-            action["selected_template"] = {
-                "workout_id": chosen.get("workout_id"),
-                "title": chosen.get("title"),
-                "step_count": chosen.get("step_count"),
-                "distance_hint_km": chosen.get("distance_hint_km"),
-            }
+    choose_and_bind(final_actions, families)
+
+    # Enforce maximum weekday duration when Garmin exposes estimated duration.
+    try:
+        max_minutes = int(prefs.get("max_weekday_session_minutes")) if prefs.get("max_weekday_session_minutes") is not None else None
+    except Exception:
+        max_minutes = None
+    if max_minutes:
+        bounded: list[dict[str, Any]] = []
+        for action in final_actions:
+            day = date_of(action.get("date"))
+            chosen = action.get("selected_template") or {}
+            duration_s = chosen.get("estimated_duration_s")
+            over = False
+            if day and day.weekday() < 5 and action.get("action") in {"ADD", "ADJUST"} and duration_s is not None:
+                try:
+                    over = float(duration_s) / 60.0 > max_minutes
+                except Exception:
+                    over = False
+            if not over:
+                bounded.append(action)
+        final_actions = bounded
 
     decorate(final_actions, context)
 
@@ -209,6 +298,8 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
     }
 
 
+# Override the base planning horizon before base.main() builds the context.
+base.allowed_dates = planning_dates
 base.validate = validate
 
 if __name__ == "__main__":
