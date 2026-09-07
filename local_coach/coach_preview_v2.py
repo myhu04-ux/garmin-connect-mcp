@@ -8,6 +8,7 @@ shown, but new/changed sessions are never written for today retroactively.
 from __future__ import annotations
 
 import datetime as dt
+from collections import defaultdict
 from typing import Any
 
 import coach_preview as base
@@ -30,7 +31,7 @@ FOCUS_LABELS = {
     "unknown": "Dagens planlagte træningsformål",
 }
 
-NON_RUN_KINDS = {"strength", "recovery_cross_training", "cycling"}
+NON_RUN_KINDS = {"strength", "strength_master", "recovery_cross_training", "cycling"}
 RED_DOWNGRADE = {
     "quality_interval": "easy_run",
     "quality_tempo": "easy_run",
@@ -67,9 +68,20 @@ def focus_for(action: dict[str, Any]) -> str:
     return FOCUS_LABELS.get(inferred_family(action), FOCUS_LABELS["unknown"])
 
 
+def multi_session_suffix(action: dict[str, Any]) -> str:
+    family = inferred_family(action)
+    if family in {"strength", "strength_master"}:
+        return "S"
+    if family in {"recovery_cross_training", "cycling"}:
+        return "X"
+    return "R"
+
+
 def decorate(actions: list[dict[str, Any]], context: dict[str, Any]) -> None:
     profile = context.get("athlete_preferences") or {}
     event = context.get("event") or {}
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
     for action in actions:
         try:
             pos = position_for(action["date"], profile, event)
@@ -81,6 +93,22 @@ def decorate(actions: list[dict[str, Any]], context: dict[str, Any]) -> None:
         action["focus"] = focus_for(action)
         chosen = action.get("selected_template") or {}
         action["workout_style"] = chosen.get("title") or action.get("source_title") or inferred_family(action)
+        groups[str(action.get("date") or "")].append(action)
+
+    # One session keeps the clean W/D name. If two distinct sessions share a day,
+    # suffix them so Garmin names remain unique (R=run, S=strength, X=cross-training).
+    for same_day in groups.values():
+        if len(same_day) <= 1:
+            continue
+        suffix_count: dict[str, int] = defaultdict(int)
+        for action in same_day:
+            base_name = action.get("plan_name")
+            if not base_name:
+                continue
+            suffix = multi_session_suffix(action)
+            suffix_count[suffix] += 1
+            number = suffix_count[suffix]
+            action["plan_name"] = f"{base_name}{suffix}{number if number > 1 else ''}"
 
 
 def choose_and_bind(actions: list[dict[str, Any]], families: dict[str, list[dict[str, Any]]]) -> None:
@@ -130,8 +158,8 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
         if name in {"KEEP", "MOVE", "ADJUST", "REMOVE"} and source is None:
             continue
 
-        # Today's existing session can be shown/kept. New or changed target sessions
-        # are only accepted from tomorrow onward.
+        # Today's session may be displayed and kept, but never newly added, moved,
+        # adjusted or removed by the automatic planning pass.
         if date == today and name != "KEEP":
             continue
 
@@ -147,7 +175,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             if not sd or not nd or abs((nd - sd).days) > 2:
                 continue
 
-        # Only a genuinely valid proposal may claim an existing calendar item.
+        # Only now is the proposal valid enough to claim an existing calendar item.
         if source is not None:
             key = (str(source.get("workout_id") or ""), str(source.get("date") or ""))
             if key in touched_existing:
@@ -171,7 +199,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             "evidence_tags": tags,
         })
 
-    # Omitted/invalid suggestions are KEEP by default, never silent deletion.
+    # Omitted/invalid suggestions become KEEP by default, never silent deletion.
     for item in existing:
         key = (str(item.get("workout_id") or ""), str(item.get("date") or ""))
         if key not in touched_existing:
@@ -188,7 +216,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
                 "evidence_tags": [],
             })
 
-    # Deterministic red-state safety override for future key/long sessions.
+    # Deterministic red-state safety override for future quality/long sessions.
     if recovery == "red":
         for action in validated:
             fam = inferred_family(action)
@@ -201,7 +229,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
                     action["intensity"] = "easy"
                     action["reason"] = "Restitutionen er rød. Nøglebelastningen nedgraderes deterministisk til et godkendt roligt pas; kontinuitet bevares uden at jagte kvalitet."
 
-    # One running session per day unless an existing session is deliberately replaced.
+    # One running session per day unless an existing run is deliberately replaced.
     existing_run_dates = {str(i.get("date")) for i in existing if is_run_title(i.get("title"))}
     occupied_new_run_dates: set[str] = set()
     one_per_day: list[dict[str, Any]] = []
@@ -209,7 +237,6 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
         fam = inferred_family(action)
         source_is_run = is_run_title(action.get("source_title")) if action.get("source_title") else False
         target_is_run = is_run_family(fam)
-
         if action["action"] == "ADD" and target_is_run:
             if action["date"] in existing_run_dates or action["date"] in occupied_new_run_dates:
                 continue
@@ -222,7 +249,6 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
                 continue
             occupied_new_run_dates.add(action["date"])
         elif action["action"] == "ADJUST" and target_is_run:
-            # Replacement on the same source date is allowed; moving is not part of ADJUST.
             occupied_new_run_dates.add(action["date"])
         one_per_day.append(action)
     validated = one_per_day
@@ -241,7 +267,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             hard_dates.add(action["date"])
         final_actions.append(action)
 
-    # Respect maximum run days for optional ADDs. Existing plan is not silently cut.
+    # Respect maximum run days for optional ADDs. Existing plan is never silently cut.
     prefs = context.get("athlete_preferences") or {}
     try:
         max_run_days = int(prefs.get("max_running_days_per_week")) if prefs.get("max_running_days_per_week") is not None else None
@@ -262,7 +288,9 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
 
     choose_and_bind(final_actions, families)
 
-    # Enforce maximum weekday duration when Garmin exposes estimated duration.
+    # Weekday-duration preference blocks only optional ADDs. A safety ADJUST (for
+    # example red recovery downgrading intervals) must never be discarded merely
+    # because no shorter approved template exists; safety outranks convenience.
     try:
         max_minutes = int(prefs.get("max_weekday_session_minutes")) if prefs.get("max_weekday_session_minutes") is not None else None
     except Exception:
@@ -274,7 +302,7 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
             chosen = action.get("selected_template") or {}
             duration_s = chosen.get("estimated_duration_s")
             over = False
-            if day and day.weekday() < 5 and action.get("action") in {"ADD", "ADJUST"} and duration_s is not None:
+            if day and day.weekday() < 5 and action.get("action") == "ADD" and duration_s is not None:
                 try:
                     over = float(duration_s) / 60.0 > max_minutes
                 except Exception:
@@ -298,7 +326,6 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
     }
 
 
-# Override the base planning horizon before base.main() builds the context.
 base.allowed_dates = planning_dates
 base.validate = validate
 
