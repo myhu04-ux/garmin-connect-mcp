@@ -2,12 +2,13 @@
 
 Default mode is dry-run. Real writes require either:
   --test-one : applies exactly one safe validated calendar action, reads Garmin
-               back, verifies the result, and only then unlocks the UI toggle.
+               back, verifies the named workout/date, and only then unlocks UI.
   --apply    : requires both writeback_test_passed=true and
-               garmin_writeback_enabled=true in coach_settings.json.
+               garmin_writeback_enabled=true.
 
-Workouts themselves are never deleted. MOVE/ADJUST schedule the new target first
-and only then unschedule the old calendar entry. Every attempted change is logged.
+Approved master workouts are never renamed or deleted. ADD/ADJUST/MOVE create or
+reuse a named copy such as ThyTrailW3D4, schedule the new copy first, then
+unschedule the old calendar entry. Every real action is read back from Garmin.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Any
 from garminconnect import Garmin
 
 from calendar_probe import extract_items
+from named_workout import ensure_named_workout
 
 ROOT = Path(r"C:\GarminCoach")
 DATA = ROOT / "data"
@@ -110,8 +112,26 @@ def find_source(calendar: dict[str, Any], action: dict[str, Any]) -> dict[str, A
 
 
 def selected_workout(action: dict[str, Any]) -> Any:
-    template = action.get("selected_template") or {}
-    return template.get("workout_id")
+    return (action.get("selected_template") or {}).get("workout_id")
+
+
+def source_master_id(action: dict[str, Any]) -> Any:
+    name = str(action.get("action") or "").upper()
+    if name in {"ADD", "ADJUST"}:
+        return selected_workout(action)
+    if name == "MOVE":
+        return action.get("source_workout_id")
+    return None
+
+
+def resolve_target_workout(api: Garmin, action: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    master_id = source_master_id(action)
+    if not master_id:
+        raise RuntimeError("Mangler godkendt master-workout til kalenderændringen.")
+    plan_name = str(action.get("plan_name") or "").strip()
+    if not plan_name:
+        return master_id, {"created": False, "cached": False, "name": None, "source_workout_id": master_id}
+    return ensure_named_workout(api, master_id, plan_name)
 
 
 def actionable(preview: dict[str, Any], allow_remove: bool) -> list[dict[str, Any]]:
@@ -192,21 +212,21 @@ def schedule_then_unschedule(
     }
 
 
-def apply_action(api: Garmin, calendar: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+def apply_action(api: Garmin, calendar: dict[str, Any], action: dict[str, Any], resolved_workout_id: Any | None) -> dict[str, Any]:
     name = str(action.get("action") or "").upper()
     target_date = str(action.get("date") or "")[:10]
     source = find_source(calendar, action)
 
     if name == "ADD":
-        return schedule_then_unschedule(api, calendar, selected_workout(action), target_date, None)
+        return schedule_then_unschedule(api, calendar, resolved_workout_id, target_date, None)
     if name == "MOVE":
         if source is None:
             raise RuntimeError("Kunne ikke entydigt finde det eksisterende kalenderpas, der skal flyttes.")
-        return schedule_then_unschedule(api, calendar, source.get("workout_id"), target_date, source)
+        return schedule_then_unschedule(api, calendar, resolved_workout_id, target_date, source)
     if name == "ADJUST":
         if source is None:
             raise RuntimeError("Kunne ikke entydigt finde det eksisterende kalenderpas, der skal justeres.")
-        return schedule_then_unschedule(api, calendar, selected_workout(action), target_date, source)
+        return schedule_then_unschedule(api, calendar, resolved_workout_id, target_date, source)
     if name == "REMOVE":
         if source is None:
             raise RuntimeError("Kunne ikke entydigt finde kalenderpasset, der skal fjernes.")
@@ -218,49 +238,66 @@ def apply_action(api: Garmin, calendar: dict[str, Any], action: dict[str, Any]) 
     raise RuntimeError(f"Ikke understøttet action: {name}")
 
 
-def expected_target_workout(action: dict[str, Any]) -> Any:
-    name = str(action.get("action") or "").upper()
-    if name in {"ADD", "ADJUST"}:
-        return selected_workout(action)
-    if name == "MOVE":
-        return action.get("source_workout_id")
-    return None
-
-
 def fetch_month_items(api: Garmin, day: dt.date) -> list[dict[str, Any]]:
-    raw = api.get_scheduled_workouts(day.year, day.month)
-    return extract_items(raw)
+    return extract_items(api.get_scheduled_workouts(day.year, day.month))
 
 
-def verify_action(api: Garmin, action: dict[str, Any]) -> tuple[bool, str]:
-    target = parse_date(action.get("date"))
-    expected = str(expected_target_workout(action) or "")
-    if not target or not expected:
-        return False, "Mangler mål-dato eller forventet workout-id til verifikation."
+def fresh_calendar(api: Garmin, action: dict[str, Any]) -> dict[str, Any]:
+    dates = [parse_date(action.get("date")), parse_date(action.get("source_date"))]
+    months: set[tuple[int, int]] = {(d.year, d.month) for d in dates if d}
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for year, month in sorted(months):
+        for item in extract_items(api.get_scheduled_workouts(year, month)):
+            k = (str(item.get("date") or ""), str(item.get("workout_id") or ""), str(item.get("scheduled_workout_id") or ""))
+            if k not in seen:
+                seen.add(k)
+                items.append(item)
+    return {"items": items}
 
-    target_items = fetch_month_items(api, target)
-    present = any(
-        str(item.get("workout_id") or "") == expected and str(item.get("date") or "")[:10] == target.isoformat()
-        for item in target_items
-    )
-    if not present:
-        return False, "Garmin read-back fandt ikke det forventede workout på mål-datoen."
 
+def verify_action(
+    api: Garmin,
+    action: dict[str, Any],
+    resolved_workout_id: Any | None,
+    original_calendar: dict[str, Any],
+) -> tuple[bool, str, dict[str, Any]]:
     name = str(action.get("action") or "").upper()
-    if name in {"MOVE", "ADJUST"}:
-        source = parse_date(action.get("source_date"))
-        old_scheduled_id = None
-        old_calendar = load(CALENDAR, {})
-        old_item = find_source(old_calendar, action)
-        if old_item:
-            old_scheduled_id = str(old_item.get("scheduled_workout_id") or "")
-        if source and source != target and old_scheduled_id:
-            source_items = target_items if source.year == target.year and source.month == target.month else fetch_month_items(api, source)
-            still_old = any(str(item.get("scheduled_workout_id") or "") == old_scheduled_id for item in source_items)
-            if still_old:
-                return False, "Det nye pas findes, men den gamle kalenderpost er stadig til stede."
+    if name == "REMOVE":
+        source = find_source(original_calendar, action)
+        if not source or not source.get("scheduled_workout_id"):
+            return False, "Mangler gammel kalenderpost til read-back.", fresh_calendar(api, action)
+        refreshed = fresh_calendar(api, action)
+        old_id = str(source.get("scheduled_workout_id"))
+        if any(str(i.get("scheduled_workout_id") or "") == old_id for i in calendar_items(refreshed)):
+            return False, "Garmin read-back viser stadig den fjernede kalenderpost.", refreshed
+        return True, "Garmin read-back bekræftede fjernelsen.", refreshed
 
-    return True, "Garmin read-back bekræftede kalenderændringen."
+    target = parse_date(action.get("date"))
+    expected = str(resolved_workout_id or "")
+    if not target or not expected:
+        return False, "Mangler mål-dato eller forventet workout-id til verifikation.", fresh_calendar(api, action)
+
+    refreshed = fresh_calendar(api, action)
+    target_item = next((
+        item for item in calendar_items(refreshed)
+        if str(item.get("workout_id") or "") == expected and str(item.get("date") or "")[:10] == target.isoformat()
+    ), None)
+    if not target_item:
+        return False, "Garmin read-back fandt ikke det forventede workout på mål-datoen.", refreshed
+
+    expected_name = str(action.get("plan_name") or "").strip()
+    actual_name = str(target_item.get("title") or "").strip()
+    if expected_name and actual_name and actual_name != expected_name:
+        return False, f"Workout ligger på datoen, men navnet er '{actual_name}' i stedet for '{expected_name}'.", refreshed
+
+    if name in {"MOVE", "ADJUST"}:
+        old_item = find_source(original_calendar, action)
+        old_id = str((old_item or {}).get("scheduled_workout_id") or "")
+        if old_id and any(str(i.get("scheduled_workout_id") or "") == old_id for i in calendar_items(refreshed)):
+            return False, "Det nye pas findes, men den gamle kalenderpost er stadig til stede.", refreshed
+
+    return True, "Garmin read-back bekræftede navn, workout og dato.", refreshed
 
 
 def set_test_passed() -> None:
@@ -299,12 +336,12 @@ def main() -> int:
         if cfg.get("writeback_test_passed"):
             print("Write-back testen er allerede markeret som bestået. Ingen ændring udført.")
             return 0
-        candidates = [a for a in actions if str(a.get("action") or "").upper() in {"ADD", "MOVE", "ADJUST"}]
+        candidates = [a for a in actions if str(a.get("action") or "").upper() in {"ADD", "ADJUST", "MOVE"}]
         if not candidates:
-            print("Ingen sikker ADD/MOVE/ADJUST er tilgængelig til write-back-testen endnu.")
+            print("Ingen sikker ADD/ADJUST/MOVE er tilgængelig til write-back-testen endnu.")
             return 4
-        # ADD is least disruptive; then MOVE; ADJUST last.
-        priority = {"ADD": 0, "MOVE": 1, "ADJUST": 2}
+        # Prefer actions that test both named cloning and calendar scheduling.
+        priority = {"ADD": 0, "ADJUST": 1, "MOVE": 2}
         candidates.sort(key=lambda a: (priority.get(str(a.get("action") or "").upper(), 9), str(a.get("date") or "")))
         actions = candidates[:1]
 
@@ -334,27 +371,32 @@ def main() -> int:
     failures = 0
     successes = 0
     for action in actions:
+        original_calendar = calendar
         record = {
             "mode": "test-one" if args.test_one else "auto-apply",
             "action": action,
             "description": describe(action),
         }
         try:
-            result = apply_action(api, calendar, action)
-            verified = True
-            verification = "Ikke ekstra read-back i auto-mode."
-            if args.test_one:
-                verified, verification = verify_action(api, action)
-                if not verified:
-                    raise RuntimeError(verification)
+            resolved_id = None
+            clone_meta: dict[str, Any] = {}
+            if str(action.get("action") or "").upper() != "REMOVE":
+                resolved_id, clone_meta = resolve_target_workout(api, action)
+            result = apply_action(api, calendar, action, resolved_id)
+            verified, verification, refreshed = verify_action(api, action, resolved_id, original_calendar)
+            if not verified:
+                raise RuntimeError(verification)
+
             record["success"] = True
+            record["resolved_workout_id"] = resolved_id
+            record["named_copy"] = clone_meta
             record["result"] = result
             record["verification"] = verification
             append_audit(record)
+            calendar = refreshed
             successes += 1
             print(f"OK: {describe(action)}")
-            if args.test_one:
-                print(f"VERIFY: {verification}")
+            print(f"VERIFY: {verification}")
         except Exception as exc:
             record["success"] = False
             record["error"] = str(exc)[:1000]
