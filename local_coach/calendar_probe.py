@@ -19,15 +19,24 @@ TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 OUT = Path(r"C:\GarminCoach\data\scheduled_workouts.json")
 
 
-def month_pairs(start: dt.date, months_ahead: int = 2) -> list[tuple[int, int]]:
+def month_pairs(start: dt.date, months_back: int = 1, months_ahead: int = 2) -> list[tuple[int, int]]:
+    """Return calendar months around today, including the previous month.
+
+    The previous month matters when a workout planned on the last day of one
+    month is completed one day later in the next month.
+    """
+    first = dt.date(start.year, start.month, 1)
     pairs: list[tuple[int, int]] = []
-    year, month = start.year, start.month
-    for _ in range(months_ahead + 1):
-        pairs.append((year, month))
-        month += 1
-        if month == 13:
+    for offset in range(-months_back, months_ahead + 1):
+        year = first.year
+        month = first.month + offset
+        while month < 1:
+            year -= 1
+            month += 12
+        while month > 12:
             year += 1
-            month = 1
+            month -= 12
+        pairs.append((year, month))
     return pairs
 
 
@@ -60,7 +69,6 @@ def extract_items(raw: Any) -> list[dict[str, Any]]:
         scheduled_id = first(d, "scheduledWorkoutId", "scheduleId", "calendarItemId")
         item_type = first(d, "itemType", "type", "calendarItemType")
 
-        # Keep only dictionaries that look plausibly like calendar/workout items.
         if not date:
             continue
         date_text = str(date)[:10]
@@ -109,7 +117,7 @@ def main() -> int:
     raw_months: dict[str, Any] = {}
     all_items: list[dict[str, Any]] = []
 
-    for year, month in month_pairs(today, 2):
+    for year, month in month_pairs(today, months_back=1, months_ahead=2):
         key = f"{year:04d}-{month:02d}"
         try:
             raw = garmin.get_scheduled_workouts(year, month)
@@ -120,7 +128,6 @@ def main() -> int:
         raw_months[key] = raw
         all_items.extend(extract_items(raw))
 
-    # De-duplicate across nested/overlapping structures.
     unique: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in all_items:
