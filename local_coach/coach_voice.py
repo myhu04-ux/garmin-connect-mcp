@@ -1,8 +1,7 @@
-"""Turn structured coach_state into useful Danish coach language.
+"""Turn structured coach state + validated 7-day plan into useful Danish coach language.
 
-The analysis remains deterministic in coach_brief.py. This layer only changes how
-it is communicated: conclusion first, concrete evidence second, next action third.
-It never changes workouts, health classification or Garmin data.
+Facts stay deterministic. This layer only communicates them: conclusion first,
+meaning second, action third. It never changes workouts or health classification.
 """
 
 from __future__ import annotations
@@ -14,12 +13,18 @@ from typing import Any
 import requests
 
 STATE = Path(r"C:\GarminCoach\data\coach_state.json")
+PREVIEW = Path(r"C:\GarminCoach\data\coach_preview.json")
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = "qwen3:1.7b"
 
 
-def load() -> dict[str, Any]:
-    return json.loads(STATE.read_text(encoding="utf-8"))
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
 def save(state: dict[str, Any]) -> None:
@@ -30,7 +35,19 @@ def moved_count(match: dict[str, Any]) -> int:
     return sum(1 for x in match.get("matches", []) if int(x.get("date_shift_days") or 0) != 0)
 
 
-def deterministic(state: dict[str, Any]) -> dict[str, Any]:
+def plan_focus(preview: dict[str, Any]) -> str:
+    actions = [a for a in preview.get("actions", []) if isinstance(a, dict)]
+    meaningful = [a for a in actions if a.get("action") != "REMOVE"]
+    parts = []
+    for action in meaningful[:3]:
+        name = action.get("plan_name") or action.get("source_title") or (action.get("selected_template") or {}).get("title")
+        focus = action.get("focus")
+        if name and focus:
+            parts.append(f"{name}: {focus}")
+    return "; ".join(parts)
+
+
+def deterministic(state: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any]:
     recovery = state.get("recovery") or {}
     training = state.get("training") or {}
     recent = training.get("last_7_days") or {}
@@ -43,56 +60,60 @@ def deterministic(state: dict[str, Any]) -> dict[str, Any]:
     if rec == "red":
         headline = "Kroppen ser presset ud – vi skal skabe plads til restitution, ikke jagte planen."
     elif rec == "yellow":
-        headline = "Du er stadig på sporet, men belastningen skal styres lidt mere forsigtigt de næste dage."
+        headline = "Du er på sporet, men vi styrer belastningen lidt mere forsigtigt de næste dage."
     elif rec == "green":
         headline = "Du ser klar ud til at fortsætte planen uden at forcere progressionen."
     else:
-        headline = "Træningen kan vurderes, men vi mangler endnu nok helbredshistorik til en sikker restitutionstrend."
+        headline = "Træningen kan vurderes, men vi mangler endnu nok historik til en sikker restitutionstrend."
 
     signals = recovery.get("signals") or []
     notable = [s for s in signals if s.get("severity") in {"yellow", "red"}]
     if notable:
         parts = []
-        for s in notable[:2]:
-            metric = s.get("metric")
-            delta = s.get("delta_pct") if s.get("delta_pct") is not None else s.get("delta")
-            unit = "%" if s.get("delta_pct") is not None else s.get("unit", "")
+        for signal in notable[:2]:
+            metric = signal.get("metric")
+            delta = signal.get("delta_pct") if signal.get("delta_pct") is not None else signal.get("delta")
+            unit = "%" if signal.get("delta_pct") is not None else signal.get("unit", "")
             sign = "+" if isinstance(delta, (int, float)) and delta > 0 else ""
-            parts.append(f"{metric} ligger {sign}{delta}{unit} fra din baseline")
-        body = " og ".join(parts) + "."
-        kroppen = f"{body} Derfor bruger vi de næste pas til at styre belastningen frem for at presse ekstra træning ind."
+            parts.append(f"{metric} ligger {sign}{delta}{unit} fra din normale baseline")
+        kroppen = " og ".join(parts) + ". Det betyder, at vi styrer de næste pas efter restitutionen frem for at presse ekstra træning ind."
     elif rec == "insufficient_history":
         latest = recovery.get("latest") or {}
         shown = []
         if latest.get("sleep_hours") is not None:
-            shown.append(f"seneste søvn {latest['sleep_hours']} timer")
+            shown.append(f"seneste søvn er {latest['sleep_hours']} timer")
         if latest.get("resting_hr") is not None:
-            shown.append(f"hvilepuls {latest['resting_hr']}")
-        tail = (" Vi kan se " + " og ".join(shown) + ", men én nat er ikke en trend.") if shown else ""
-        kroppen = f"Vi har {recovery.get('history_days', 0)} historikdage lige nu.{tail} Coachen bliver mere sikker, efterhånden som din personlige baseline fyldes op."
+            shown.append(f"hvilepulsen er {latest['resting_hr']}")
+        tail = (" Vi kan se, at " + " og ".join(shown) + ", men én nat er ikke en trend.") if shown else ""
+        kroppen = f"Vi har {recovery.get('history_days', 0)} historikdage lige nu.{tail} Vurderingen bliver mere sikker, efterhånden som din egen baseline fyldes op."
     else:
         kroppen = "De seneste restitutionssignaler ligger samlet tæt på din egen normal. Der er ikke noget i data, der i sig selv kræver en markant nedjustering."
 
     planned = int(match.get("planned_workouts") or 0)
     matched = int(match.get("matched") or 0)
     moved = moved_count(match)
+    pending = int(match.get("pending") or 0)
     if planned:
-        shift_text = f" {moved} af dem blev flyttet en dag eller to og tæller stadig som gennemført." if moved else ""
-        traeningen = (
-            f"Du har gennemført {matched} af {planned} planlagte pas i matchvinduet.{shift_text} "
-            f"De seneste 7 dage blev det til {recent.get('km', 0)} km mod {previous.get('km', 0)} km ugen før."
-        )
+        shift_text = f" {moved} blev flyttet en dag eller to og tæller stadig som gennemført." if moved else ""
+        traeningen = f"Du har gennemført {matched} af {planned} afgjorte planpas.{shift_text} De seneste 7 dage blev det til {recent.get('km', 0)} km mod {previous.get('km', 0)} km ugen før."
+        if pending:
+            traeningen += f" Dagens {pending} planlagte pas står som afventer – ikke som misset."
+    elif pending:
+        traeningen = f"Der er ingen tidligere planpas, der mangler at blive afgjort lige nu. Dagens pas afventer stadig, og de seneste 7 dage viser {recent.get('km', 0)} km fordelt på {recent.get('runs', 0)} ture."
     else:
-        traeningen = f"Der er endnu ikke nok kalenderdata til at måle plan mod gennemført. De seneste 7 dage viser {recent.get('km', 0)} km fordelt på {recent.get('runs', 0)} løbeture."
+        traeningen = f"Der er endnu ikke nok kalenderdata til at måle plan mod gennemført. De seneste 7 dage viser {recent.get('km', 0)} km fordelt på {recent.get('runs', 0)} ture."
 
-    if focus:
+    preview_focus = plan_focus(preview)
+    if preview_focus:
+        naeste = f"De næste nøglepas er {preview_focus}. Det vigtigste er at ramme formålet med passene – ikke at jagte et bestemt tempo på en dag, hvor kroppen siger noget andet."
+    elif focus:
         naeste = " ".join(str(x) for x in focus[:2])
     else:
         naeste = f"Næste blok skal fortsat bygge mod {event.get('name') or 'dit aktive mål'} uden at øge både mængde og intensitet samtidig."
 
     attention = []
     if match.get("uncertain"):
-        attention.append("Der er mindst ét planmatch, som coachen ikke er sikker nok på til at bruge som facit.")
+        attention.append("Der er et planmatch, som coachen ikke er sikker nok på til at bruge som facit.")
     if match.get("missed"):
         attention.append("Et planlagt pas uden sikkert match bliver ikke automatisk presset ind senere.")
 
@@ -102,32 +123,47 @@ def deterministic(state: dict[str, Any]) -> dict[str, Any]:
         "traeningen": traeningen,
         "naeste_fokus": naeste,
         "opmaerksomhed": attention[:3],
-        # Compatibility with the first UI/dashboard.
         "helbred": kroppen,
         "fokus": naeste,
     }
 
 
-def prompt(state: dict[str, Any]) -> str:
+def prompt(state: dict[str, Any], preview: dict[str, Any]) -> str:
+    compact_actions = []
+    for action in preview.get("actions", []) if isinstance(preview, dict) else []:
+        if not isinstance(action, dict):
+            continue
+        compact_actions.append({
+            "date": action.get("date"),
+            "plan_name": action.get("plan_name"),
+            "focus": action.get("focus"),
+            "reason": action.get("reason"),
+            "action": action.get("action"),
+            "workout_style": action.get("workout_style"),
+        })
     compact = {
         "recovery": state.get("recovery"),
         "training": state.get("training"),
         "plan_match": state.get("plan_match"),
         "event": state.get("event"),
         "focus_points": state.get("focus_points"),
+        "validated_next_7_days": compact_actions,
     }
     return f"""Du er en personlig løbetræner, som taler direkte til løberen på naturligt dansk.
-Du får allerede analyserede fakta. Din opgave er KUN at kommunikere dem godt.
+Du får allerede analyserede fakta og en VALIDERET 7-dages plan. Din opgave er KUN
+at kommunikere, hvad det betyder. Du må ikke ændre planen eller opfinde nye fakta.
 
 SPROGREGLER
 - Start med konklusionen: hvad betyder data for løberen lige nu?
-- Skriv som en træner, ikke som en laboratorierapport eller AI-assistent.
-- Brug korte, konkrete sætninger og højst 1-2 tal i hvert afsnit.
-- Forklar betydningen af tallene. Tal må aldrig stå alene som argument.
-- Brug hverdagssprog. Undgå jargon som load, readiness, ATL/CTL osv.; hvis et fagord er nødvendigt, forklar det.
-- Et pas flyttet +/-1 dag, som er sikkert matchet, er gennemført - ikke misset.
-- Vær positiv og konstruktiv, men ikke overdrevent rosende.
-- Fortæl tydeligt, hvad der er vigtigst de næste dage.
+- Skriv som en erfaren løbetræner, ikke som en laboratorierapport eller AI-assistent.
+- Kort og konkret. Højst 1-2 tal i hvert afsnit.
+- Forklar betydningen af tallene; rems dem ikke bare op.
+- Brug hverdagssprog. Undgå jargon som load/readiness/ATL/CTL.
+- Et sikkert matchet pas flyttet +/-1 dag er gennemført, ikke misset.
+- Et endnu ikke gennemført pas i dag er AFVENTER, ikke misset.
+- Vær konstruktiv og rolig, ikke overdrevent rosende eller kontrollerende.
+- Giv en kort begrundelse for fokus: hvorfor hjælper det mod det aktuelle løb?
+- Brug gerne de korte plan-navne (fx ThyTrailW3D4), når du omtaler konkrete kommende pas.
 - Hvis historikken ikke er stærk nok, sig det enkelt og undlad at gætte.
 - Ingen medicinske diagnoser.
 - Ingen opdigtede data, træninger eller løbsfakta.
@@ -136,27 +172,27 @@ Returner KUN gyldig JSON:
 {{
   "headline": "én skarp sætning",
   "kroppen": "2-3 korte sætninger: hvad ser du og hvad betyder det?",
-  "traeningen": "2-3 korte sætninger: er planen på sporet, inkl. flyttede pas?",
-  "naeste_fokus": "2-3 korte sætninger: hvad skal være vigtigst nu og hvorfor?",
+  "traeningen": "2-3 korte sætninger: er planen på sporet, inkl. flyttede/afventende pas?",
+  "naeste_fokus": "2-3 korte sætninger: hvilke konkrete pas/fokus er vigtigst nu og hvorfor?",
   "opmaerksomhed": ["maks 3 korte ting, kun hvis relevant"]
 }}
 
-FAKTA:
+FAKTA OG VALIDERET PLAN:
 {json.dumps(compact, ensure_ascii=False, indent=2)}
 """
 
 
-def call_model(state: dict[str, Any]) -> dict[str, Any] | None:
+def call_model(state: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any] | None:
     payload = {
         "model": MODEL,
         "stream": False,
         "think": False,
         "format": "json",
         "messages": [
-            {"role": "system", "content": "Skriv som en konkret dansk løbetræner. Kun valid JSON, ingen nye fakta."},
-            {"role": "user", "content": prompt(state)},
+            {"role": "system", "content": "Skriv som en konkret dansk løbetræner. Kun valid JSON, ingen nye fakta eller ændringer af planen."},
+            {"role": "user", "content": prompt(state, preview)},
         ],
-        "options": {"temperature": 0.15, "num_predict": 900},
+        "options": {"temperature": 0.15, "num_predict": 850},
     }
     try:
         response = requests.post(OLLAMA_URL, json=payload, timeout=120)
@@ -175,10 +211,11 @@ def call_model(state: dict[str, Any]) -> dict[str, Any] | None:
 
 def main() -> int:
     if not STATE.exists():
-        print("ERROR: coach_state.json mangler. Kør coach_brief.py først.")
+        print("ERROR: coach_state.json mangler. Kør coach_brief_v2.py først.")
         return 2
-    state = load()
-    narrative = call_model(state) or deterministic(state)
+    state = read_json(STATE, {})
+    preview = read_json(PREVIEW, {})
+    narrative = call_model(state, preview) or deterministic(state, preview)
     state["narrative"] = narrative
     save(state)
 
