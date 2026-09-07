@@ -1,18 +1,14 @@
-r"""Generate a read-only adaptive training preview for the active race goal.
+r"""Create a validated 7-day coaching proposal without writing to Garmin.
 
-Inputs stay local on the Acer PC:
-- C:\GarminCoach\data\snapshot.json (Garmin snapshot)
-- local goal JSON from this repository
-
-The script summarizes recent training/recovery, derives conservative guardrails,
-and asks a local Ollama model to produce a structured 7-day plan. Nothing is
-written to Garmin. If Ollama is unavailable, a deterministic fallback preview
-is still produced.
+This is the bridge between analysis and later write-back. The language model
+may choose coaching actions, but it cannot invent dates or arbitrary workout
+structures. Dates come from Python; workouts come from the approved Garmin
+library. Existing calendar sessions are the starting point. External plans are
+optional evidence, never commands.
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 from pathlib import Path
@@ -20,388 +16,457 @@ from typing import Any
 
 import requests
 
-DEFAULT_SNAPSHOT = Path(r"C:\GarminCoach\data\snapshot.json")
-DEFAULT_GOAL = Path(__file__).parent / "goals" / "thy-trail-2026.json"
-DEFAULT_OUTPUT = Path(r"C:\GarminCoach\data\coach_preview.json")
-DEFAULT_TEXT = Path(r"C:\GarminCoach\data\coach_preview.txt")
+STATE = Path(r"C:\GarminCoach\data\coach_state.json")
+CALENDAR = Path(r"C:\GarminCoach\data\scheduled_workouts.json")
+TEMPLATES = Path(r"C:\GarminCoach\data\approved_workout_templates.json")
+KNOWLEDGE = Path(r"C:\GarminCoach\data\training_knowledge.json")
+PROFILE = Path(r"C:\GarminCoach\data\athlete_profile.json")
+OUT = Path(r"C:\GarminCoach\data\coach_preview.json")
+TEXT_OUT = Path(r"C:\GarminCoach\data\coach_preview.txt")
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = "qwen3:1.7b"
 
+ALLOWED_ACTIONS = {"KEEP", "MOVE", "ADJUST", "ADD", "REMOVE"}
+HARD_FAMILIES = {"quality_interval", "quality_tempo"}
+RUN_FAMILIES = {"easy_run", "trail_easy", "quality_interval", "quality_tempo", "long_trail", "back_to_back", "shakeout"}
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
-
-def km(value: Any) -> float:
+def load(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
     try:
-        return round(float(value or 0) / 1000.0, 2)
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return 0.0
+        return default
 
 
-def minutes(value: Any) -> float:
+def date_of(value: Any) -> dt.date | None:
     try:
-        return round(float(value or 0) / 60.0, 1)
-    except Exception:
-        return 0.0
-
-
-def date_of(activity: dict[str, Any]) -> dt.date | None:
-    raw = str(activity.get("start") or "")[:10]
-    try:
-        return dt.date.fromisoformat(raw)
+        return dt.date.fromisoformat(str(value or "")[:10])
     except Exception:
         return None
 
 
-def summarize(snapshot: dict[str, Any], goal: dict[str, Any]) -> dict[str, Any]:
-    activities = snapshot.get("running_activities") or []
+def allowed_dates() -> list[str]:
     today = dt.date.today()
-    week_ago = today - dt.timedelta(days=6)
-    prev_week_start = today - dt.timedelta(days=13)
-    prev_week_end = today - dt.timedelta(days=7)
+    return [(today + dt.timedelta(days=i)).isoformat() for i in range(1, 8)]
 
-    current_week = [a for a in activities if (date_of(a) and date_of(a) >= week_ago)]
-    previous_week = [
-        a
-        for a in activities
-        if date_of(a) and prev_week_start <= date_of(a) <= prev_week_end
-    ]
 
-    def group_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        distances = [km(a.get("distance_m")) for a in rows]
-        durations = [minutes(a.get("duration_s")) for a in rows]
-        loads = [float(a.get("training_load")) for a in rows if a.get("training_load") is not None]
-        elevation = [float(a.get("elevation_gain_m")) for a in rows if a.get("elevation_gain_m") is not None]
-        return {
-            "runs": len(rows),
-            "distance_km": round(sum(distances), 1),
-            "duration_min": round(sum(durations), 0),
-            "longest_run_km": round(max(distances), 1) if distances else 0,
-            "longest_run_min": round(max(durations), 0) if durations else 0,
-            "training_load_sum": round(sum(loads), 1) if loads else None,
-            "elevation_gain_m": round(sum(elevation), 0) if elevation else None,
-        }
+def upcoming(calendar: dict[str, Any], dates: list[str]) -> list[dict[str, Any]]:
+    allowed = set(dates)
+    rows = []
+    for item in calendar.get("items", []):
+        d = str(item.get("date") or "")[:10]
+        if d not in allowed:
+            continue
+        rows.append({
+            "date": d,
+            "title": item.get("title"),
+            "workout_id": item.get("workout_id"),
+            "scheduled_workout_id": item.get("scheduled_workout_id"),
+        })
+    return sorted(rows, key=lambda r: (r["date"], str(r.get("title") or "")))
 
-    recent = group_stats(current_week)
-    previous = group_stats(previous_week)
 
-    sleep = snapshot.get("sleep") or {}
-    wellness = snapshot.get("today") or {}
-    readiness = snapshot.get("training_readiness") or []
+def phase(event: dict[str, Any]) -> str:
+    days = event.get("days_to_event")
+    try:
+        days = int(days)
+    except Exception:
+        return "unknown"
+    if days <= 14:
+        return "taper"
+    if days <= 35:
+        return "race_specific_peak"
+    if days <= 70:
+        return "specific_build"
+    return "base_build"
 
-    signals: list[str] = []
-    recovery_state = "green"
-    penalty = 0
 
-    sleep_h = sleep.get("sleep_hours")
-    sleep_score = sleep.get("sleep_score")
-    overnight_hrv = sleep.get("avg_overnight_hrv")
-    rhr = wellness.get("resting_hr") or sleep.get("resting_hr")
-    rhr_avg = wellness.get("resting_hr_7d_avg")
+def compact_knowledge(knowledge: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    etype = str(event.get("event_type") or "").lower()
+    course = json.dumps(event.get("course") or {}, ensure_ascii=False).lower()
+    relevant_categories = {"weekly_structure", "long_run", "easy_running", "recovery", "cutback", "taper", "fueling", "strength"}
+    if "trail" in etype or "trail" in course:
+        relevant_categories |= {"specificity", "cross_training"}
+    if "marathon" in etype:
+        relevant_categories |= {"quality", "specificity"}
 
-    if sleep_h is not None:
-        if sleep_h < 5.5:
-            penalty += 3
-            signals.append(f"very short sleep ({sleep_h:.1f} h)")
-        elif sleep_h < 6.5:
-            penalty += 2
-            signals.append(f"short sleep ({sleep_h:.1f} h)")
-        elif sleep_h < 7.0:
-            penalty += 1
-            signals.append(f"sleep slightly short ({sleep_h:.1f} h)")
+    out: list[dict[str, Any]] = []
+    for ref_index, ref in enumerate(knowledge.get("references", []) or [], start=1):
+        if not isinstance(ref, dict):
+            continue
+        ref_name = ref.get("reference_name") or ref.get("reference_input") or f"reference {ref_index}"
+        for p_index, item in enumerate(ref.get("principles", []) or [], start=1):
+            if not isinstance(item, dict) or item.get("confidence") == "low":
+                continue
+            category = str(item.get("category") or "other")
+            if category not in relevant_categories:
+                continue
+            out.append({
+                "tag": f"P{ref_index}.{p_index}",
+                "reference": ref_name,
+                "category": category,
+                "principle": item.get("principle"),
+                "evidence": item.get("evidence"),
+                "confidence": item.get("confidence"),
+            })
+    return out[:16]
 
-    if sleep_score is not None:
-        if sleep_score < 55:
-            penalty += 3
-            signals.append(f"low sleep score ({sleep_score})")
-        elif sleep_score < 70:
-            penalty += 1
-            signals.append(f"moderate sleep score ({sleep_score})")
 
-    if rhr is not None and rhr_avg is not None:
-        delta = float(rhr) - float(rhr_avg)
-        if delta >= 6:
-            penalty += 3
-            signals.append(f"resting HR {delta:.0f} bpm above 7-day average")
-        elif delta >= 3:
-            penalty += 1
-            signals.append(f"resting HR {delta:.0f} bpm above 7-day average")
+def template_families(library: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    families = library.get("families") or {}
+    return {str(k): v for k, v in families.items() if isinstance(v, list) and v}
 
-    if readiness:
-        scores = [r.get("score") for r in readiness if r.get("score") is not None]
-        if scores:
-            score = float(scores[0])
-            if score < 35:
-                penalty += 3
-                signals.append(f"Garmin readiness low ({score:.0f})")
-            elif score < 55:
-                penalty += 1
-                signals.append(f"Garmin readiness moderate ({score:.0f})")
 
-    if penalty >= 4:
-        recovery_state = "red"
-    elif penalty >= 2:
-        recovery_state = "yellow"
+def target_mid(item: dict[str, Any]) -> float | None:
+    hint = item.get("distance_hint_km") or {}
+    try:
+        low = float(hint.get("low"))
+        high = float(hint.get("high"))
+        return (low + high) / 2.0
+    except Exception:
+        return None
 
-    event_date = dt.date.fromisoformat(goal["event_dates"][0])
-    days_to_event = max(0, (event_date - today).days)
-    weeks_to_event = round(days_to_event / 7.0, 1)
-    if days_to_event <= 10:
-        phase = "taper"
-    elif days_to_event <= 28:
-        phase = "race_specific_peak"
-    elif days_to_event <= 56:
-        phase = "specific_build"
-    else:
-        phase = "base_build"
 
-    reference_km = max(recent["distance_km"], previous["distance_km"], 1.0)
-    if recovery_state == "red":
-        target_low = reference_km * 0.55
-        target_high = reference_km * 0.75
-    elif recovery_state == "yellow":
-        target_low = reference_km * 0.75
-        target_high = reference_km * 0.95
-    elif phase == "taper":
-        target_low = reference_km * 0.60
-        target_high = reference_km * 0.80
-    else:
-        target_low = reference_km * 0.95
-        target_high = reference_km * 1.08
+def choose_template(families: dict[str, list[dict[str, Any]]], family: str, target_km: Any = None) -> dict[str, Any] | None:
+    rows = families.get(family) or []
+    if not rows:
+        return None
+    if family == "strength_master":
+        return rows[0]
+    try:
+        target = float(target_km)
+    except Exception:
+        target = None
+    if target is None:
+        return rows[0]
+    ranked = []
+    for row in rows:
+        mid = target_mid(row)
+        ranked.append((abs(mid - target) if mid is not None else 9999.0, row))
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1]
 
+
+def build_context(state: dict[str, Any], calendar: dict[str, Any], library: dict[str, Any], knowledge: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    dates = allowed_dates()
+    event = state.get("event") or {}
+    families = template_families(library)
     return {
-        "generated_date": today.isoformat(),
-        "days_to_event": days_to_event,
-        "weeks_to_event": weeks_to_event,
-        "phase": phase,
-        "recovery_state": recovery_state,
-        "recovery_signals": signals,
-        "available_recovery_metrics": {
-            "sleep_hours": sleep_h,
-            "sleep_score": sleep_score,
-            "overnight_hrv": overnight_hrv,
-            "resting_hr": rhr,
-            "resting_hr_7d_avg": rhr_avg,
-            "training_readiness_available": bool(readiness),
-            "body_battery_current": wellness.get("body_battery_current"),
-            "avg_stress": wellness.get("avg_stress"),
+        "allowed_dates": dates,
+        "phase": phase(event),
+        "recovery": state.get("recovery") or {},
+        "training": state.get("training") or {},
+        "plan_match": state.get("plan_match") or {},
+        "event": event,
+        "event_focus_points": state.get("focus_points") or [],
+        "existing_calendar": upcoming(calendar, dates),
+        "available_workout_families": {
+            family: [
+                {
+                    "workout_id": row.get("workout_id"),
+                    "title": row.get("title"),
+                    "distance_hint_km": row.get("distance_hint_km"),
+                    "step_count": row.get("step_count"),
+                }
+                for row in rows
+            ]
+            for family, rows in families.items()
         },
-        "last_7_days": recent,
-        "previous_7_days": previous,
-        "safe_next_week_distance_km": {
-            "low": round(target_low, 1),
-            "high": round(target_high, 1),
+        "external_plan_principles": compact_knowledge(knowledge, event),
+        "athlete_preferences": profile or {},
+        "rules": {
+            "existing_calendar_is_starting_point": True,
+            "do_not_make_up_missed_sessions_automatically": True,
+            "dates_must_come_from_allowed_dates": True,
+            "new_or_adjusted_workouts_must_use_approved_family": True,
+            "strength_must_use_exact_strength_master": True,
+            "external_plan_is_inspiration_only": True,
+            "event_and_personal_data_override_external_plan": True,
+            "avoid_consecutive_hard_days": True,
+            "back_to_back_second_day_must_be_easy": True,
         },
     }
 
 
-def next_monday(today: dt.date) -> dt.date:
-    return today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)
+def prompt(context: dict[str, Any]) -> str:
+    return f"""Du er personlig løbetræner. Lav en ændringsplan for de NÆSTE 7 DAGE.
+Du må kun arbejde inden for konteksten nedenfor.
 
+VIGTIG PRIORITET:
+1. Faktisk restitution og gennemført træning.
+2. Det konkrete løb og dets dokumenterede krav.
+3. Eksisterende Garmin-kalender og godkendte Garmin-workouts.
+4. Eksterne træningsprogrammer er kun inspiration. Brug kun relevante principper.
 
-def fallback_plan(summary: dict[str, Any], goal: dict[str, Any]) -> dict[str, Any]:
-    """Safe deterministic plan if the local model is unavailable."""
-    today = dt.date.today()
-    start = next_monday(today)
-    state = summary["recovery_state"]
-    phase = summary["phase"]
-    longest = float(summary["last_7_days"].get("longest_run_min") or 60)
+TRÆNERADFÆRD
+- Behold en eksisterende god plan, hvis der ikke er en god grund til at ændre den.
+- Et pas flyttet en dag og allerede gennemført er ikke et problem, der skal indhentes.
+- Undgå catch-up stacking: missede pas skal normalt ikke presses ind senere.
+- Ved dårlig restitution: reducer først intensitet/volumen, behold kontinuitet hvis rimeligt.
+- Ved god restitution: progression skal stadig være gradvis.
+- Styrke må KUN bruge strength_master.
+- Ingen frie workout-opfindelser. Vælg en family, Python vælger det konkrete Garmin-workout.
+- Alt brugervendt tekst på dansk.
 
-    if state == "red":
-        quality = "45 min meget roligt; ingen intervaller"
-        sat = f"{max(50, round(longest * 0.70)):.0f} min rolig trail"
-        sun = "Hvile eller 30 min gang"
-    elif state == "yellow":
-        quality = "45-50 min roligt med 4 x 20 s lette stigningsløb, kun hvis benene føles gode"
-        sat = f"{max(60, round(longest * 0.90)):.0f} min rolig trail, øv energiindtag"
-        sun = "35-40 min meget rolig trail på trætte ben"
-    else:
-        quality = "55-65 min i alt inkl. 6 x 3 min kontrolleret bakke, rolig jog som pause"
-        if phase in {"specific_build", "race_specific_peak"}:
-            sat = f"{max(75, round(longest * 1.05)):.0f} min rolig trail, bakker/ujævnt terræn, øv energiindtag"
-            sun = "45-55 min rolig trail på trætte ben; lav intensitet"
-        elif phase == "taper":
-            sat = f"{max(55, round(longest * 0.70)):.0f} min rolig trail"
-            sun = "30-40 min roligt"
-        else:
-            sat = f"{max(70, round(longest * 1.05)):.0f} min rolig lang tur"
-            sun = "40-45 min roligt"
-
-    sessions = [
-        {"date": start.isoformat(), "type": "rest", "purpose": "absorbere den seneste træning"},
-        {"date": (start + dt.timedelta(days=1)).isoformat(), "type": "easy_run", "session": "45-55 min roligt", "purpose": "aerob vedligeholdelse"},
-        {"date": (start + dt.timedelta(days=3)).isoformat(), "type": "quality", "session": quality, "purpose": "bakkestyrke og løbeøkonomi uden unødig træthed"},
-        {"date": (start + dt.timedelta(days=5)).isoformat(), "type": "long_trail", "session": sat, "purpose": "Thy-specifik tid på benene samt terræn- og energiøvelse"},
-        {"date": (start + dt.timedelta(days=6)).isoformat(), "type": "back_to_back", "session": sun, "purpose": "robusthed til dag 2 i etapeløbet"},
-    ]
-    return {
-        "source": "deterministic_fallback",
-        "goal": goal["name"],
-        "phase": phase,
-        "recovery_state": state,
-        "week_start": start.isoformat(),
-        "sessions": sessions,
-        "coach_note": "Kun preview. Garmin write-back er fortsat slået fra.",
-    }
-
-
-def model_prompt(summary: dict[str, Any], goal: dict[str, Any]) -> str:
-    return f"""Du er en konservativ udholdenhedstræner for EN løber.
-Målet er et todages trail-etapeløb. Brug løbsmålet, den aktuelle fase, de seneste
-Garmin-data og restitutionssignaler nedenfor. Løberen skal forberedes til 23 km
-dag 1 og 19 km dag 2 med skov, teknisk trail, grus, klit/hede, sand/strand og vind.
-
-REGLER
-- Bevar blokkens formål: specifik forberedelse til et todages trailløb.
-- Tilpas planen til restitution og nylig træning; brug ikke en rigid skabelon.
-- Hold samlet løbedistance inden for den angivne sikre km-ramme.
-- Undgå to hårde dage i træk. Back-to-back weekend er kun rolig/moderat; dag 2 træner løb på trætte ben.
-- Brug trail/ujævnt terræn og energi-/væskeøvelse hvor relevant.
-- Ved red restitution fjernes kvalitet og træningen reduceres.
-- Ved yellow restitution skal kvalitet være reduceret eller valgfri.
-- Manglende Training Readiness er IKKE det samme som dårlig restitution.
-- Dette er KUN PREVIEW. Påstå aldrig at noget er skrevet til Garmin.
-- Foretræk 4 løbedage, medmindre nylig frekvens eller restitution taler for 3.
-- Skriv kort og konkret dansk i JSON-værdierne.
-
-AKTIVT MÅL:
-{json.dumps(goal, ensure_ascii=False, indent=2)}
-
-AKTUEL STATUS:
-{json.dumps(summary, ensure_ascii=False, indent=2)}
-
-Returner KUN gyldig JSON med præcis denne topstruktur:
+Returner KUN valid JSON:
 {{
-  "source": "ollama",
-  "goal": "...",
-  "phase": "...",
-  "recovery_state": "green|yellow|red",
-  "week_start": "YYYY-MM-DD",
-  "weekly_distance_target_km": 0.0,
-  "week_focus": "...",
-  "sessions": [
+  "week_assessment": "kort trænerfaglig vurdering",
+  "actions": [
     {{
-      "date": "YYYY-MM-DD",
-      "type": "rest|easy_run|quality|long_trail|back_to_back|strength",
-      "session": "...",
-      "purpose": "...",
-      "intensity": "...",
-      "garmin_structured_candidate": true
+      "action": "KEEP|MOVE|ADJUST|ADD|REMOVE",
+      "source_date": "YYYY-MM-DD eller null",
+      "source_workout_id": "eksisterende workout-id eller null",
+      "date": "en dato fra allowed_dates",
+      "family": "approved family eller null",
+      "target_km": null,
+      "intensity": "easy|moderate|hard|strength|rest",
+      "reason": "kort dansk forklaring",
+      "evidence_tags": ["P1.1"]
     }}
   ],
-  "coach_note": "..."
+  "focus_next_14_days": ["maks 5 korte punkter"],
+  "coach_note": "kort dansk note"
 }}
+
+KONTEKST:
+{json.dumps(context, ensure_ascii=False, indent=2)}
 """
 
 
-def call_ollama(summary: dict[str, Any], goal: dict[str, Any], model: str) -> dict[str, Any]:
+def call_model(context: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        "model": model,
+        "model": MODEL,
         "stream": False,
         "think": False,
         "format": "json",
         "messages": [
-            {"role": "system", "content": "Returner kun streng gyldig JSON. Vær konservativ, konkret og datadrevet."},
-            {"role": "user", "content": model_prompt(summary, goal)},
+            {"role": "system", "content": "Svar kun valid JSON på dansk. Prioritér sikker, konservativ træningsplanlægning."},
+            {"role": "user", "content": prompt(context)},
         ],
-        "options": {
-            "temperature": 0.15,
-            "num_predict": 1200,
-        },
+        "options": {"temperature": 0.1, "num_predict": 1800},
     }
-    response = requests.post(OLLAMA_URL, json=payload, timeout=180)
+    response = requests.post(OLLAMA_URL, json=payload, timeout=240)
     response.raise_for_status()
-    body = response.json()
-    content = body.get("message", {}).get("content", "")
-    plan = json.loads(content)
-    plan["source"] = "ollama"
-    return plan
+    return json.loads(response.json().get("message", {}).get("content", ""))
 
 
-def render_text(plan: dict[str, Any], summary: dict[str, Any]) -> str:
+def deterministic_fallback(context: dict[str, Any]) -> dict[str, Any]:
+    actions = []
+    for item in context["existing_calendar"]:
+        actions.append({
+            "action": "KEEP",
+            "source_date": item["date"],
+            "source_workout_id": item.get("workout_id"),
+            "date": item["date"],
+            "family": None,
+            "target_km": None,
+            "intensity": "moderate",
+            "reason": "Eksisterende Garmin-plan beholdes, fordi fallback ikke har grundlag for en sikker ændring.",
+            "evidence_tags": [],
+        })
+    return {
+        "week_assessment": "Den lokale model kunne ikke levere en validerbar ændringsplan. Eksisterende Garmin-plan beholdes uændret.",
+        "actions": actions,
+        "focus_next_14_days": context.get("event_focus_points") or [],
+        "coach_note": "Konservativ fallback: ingen nye pas er tilføjet.",
+    }
+
+
+def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, Any]) -> dict[str, Any]:
+    dates = set(context["allowed_dates"])
+    existing = context["existing_calendar"]
+    by_key = {(str(i.get("workout_id") or ""), i["date"]): i for i in existing}
+    by_workout = {str(i.get("workout_id") or ""): i for i in existing if i.get("workout_id") is not None}
+    families = template_families(library)
+    valid_tags = {p["tag"] for p in context.get("external_plan_principles", [])}
+    recovery = str((context.get("recovery") or {}).get("state") or "")
+
+    validated: list[dict[str, Any]] = []
+    touched_existing: set[tuple[str, str]] = set()
+
+    for action in raw.get("actions", []) if isinstance(raw.get("actions"), list) else []:
+        if not isinstance(action, dict):
+            continue
+        name = str(action.get("action") or "").upper()
+        if name not in ALLOWED_ACTIONS:
+            continue
+        date = str(action.get("date") or "")[:10]
+        if date not in dates:
+            continue
+
+        source_date = str(action.get("source_date") or "")[:10] if action.get("source_date") else None
+        source_workout_id = str(action.get("source_workout_id") or "") if action.get("source_workout_id") is not None else None
+        source = None
+        if source_workout_id:
+            source = by_workout.get(source_workout_id)
+        if source is None and source_date:
+            for item in existing:
+                if item["date"] == source_date:
+                    source = item
+                    break
+
+        if name in {"KEEP", "MOVE", "ADJUST", "REMOVE"} and source is None:
+            continue
+        if source is not None:
+            key = (str(source.get("workout_id") or ""), source["date"])
+            if key in touched_existing:
+                continue
+            touched_existing.add(key)
+
+        family = str(action.get("family") or "") or None
+        if name in {"ADD", "ADJUST"}:
+            if family not in families:
+                continue
+            if family == "strength_master":
+                action["intensity"] = "strength"
+            if recovery == "red" and family in HARD_FAMILIES:
+                continue
+
+        # A two-day move is possible, but further date movement is not accepted here.
+        if name == "MOVE" and source is not None:
+            sd = date_of(source["date"])
+            nd = date_of(date)
+            if not sd or not nd or abs((nd - sd).days) > 2:
+                continue
+
+        tags = [str(t) for t in action.get("evidence_tags", []) if str(t) in valid_tags]
+        validated.append({
+            "action": name,
+            "source_date": source.get("date") if source else None,
+            "source_title": source.get("title") if source else None,
+            "source_workout_id": source.get("workout_id") if source else None,
+            "date": date,
+            "family": family,
+            "target_km": action.get("target_km"),
+            "intensity": str(action.get("intensity") or "moderate").lower(),
+            "reason": str(action.get("reason") or "Ingen begrundelse angivet.")[:500],
+            "evidence_tags": tags,
+        })
+
+    # Any existing workout the model forgot is KEEP, not silently deleted.
+    for item in existing:
+        key = (str(item.get("workout_id") or ""), item["date"])
+        if key not in touched_existing:
+            validated.append({
+                "action": "KEEP",
+                "source_date": item["date"],
+                "source_title": item.get("title"),
+                "source_workout_id": item.get("workout_id"),
+                "date": item["date"],
+                "family": None,
+                "target_km": None,
+                "intensity": "moderate",
+                "reason": "Eksisterende plan beholdes; modellen gav ingen validerbar grund til at ændre den.",
+                "evidence_tags": [],
+            })
+
+    # Enforce no consecutive hard days by keeping only the earlier validated hard change.
+    hard_dates: set[str] = set()
+    final_actions: list[dict[str, Any]] = []
+    for action in sorted(validated, key=lambda a: (a["date"], a["action"] != "KEEP")):
+        family = action.get("family")
+        is_hard = family in HARD_FAMILIES or action.get("intensity") == "hard"
+        d = date_of(action["date"])
+        if is_hard and d:
+            if any(abs((d - date_of(existing_date)).days) == 1 for existing_date in hard_dates if date_of(existing_date)):
+                if action["action"] in {"ADD", "ADJUST"}:
+                    continue
+            hard_dates.add(action["date"])
+        final_actions.append(action)
+
+    # Bind every ADD/ADJUST to a real approved Garmin workout template.
+    for action in final_actions:
+        if action["action"] not in {"ADD", "ADJUST"} or not action.get("family"):
+            continue
+        chosen = choose_template(families, action["family"], action.get("target_km"))
+        if chosen:
+            action["selected_template"] = {
+                "workout_id": chosen.get("workout_id"),
+                "title": chosen.get("title"),
+                "step_count": chosen.get("step_count"),
+                "distance_hint_km": chosen.get("distance_hint_km"),
+            }
+
+    result = {
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "preview_only": True,
+        "garmin_writeback": False,
+        "phase": context.get("phase"),
+        "week_assessment": str(raw.get("week_assessment") or "")[:1200],
+        "actions": final_actions,
+        "focus_next_14_days": [str(x)[:400] for x in (raw.get("focus_next_14_days") or [])[:5]],
+        "coach_note": str(raw.get("coach_note") or "")[:800],
+        "external_principles_available": context.get("external_plan_principles", []),
+    }
+    return result
+
+
+def render(plan: dict[str, Any]) -> str:
     lines = [
-        "GARMIN LOCAL COACH - PREVIEW ONLY",
-        "=" * 44,
-        f"Mål: {plan.get('goal', '')}",
-        f"Fase: {plan.get('phase', summary.get('phase'))}",
-        f"Restitution: {plan.get('recovery_state', summary.get('recovery_state'))}",
-        f"Uger til løb: {summary.get('weeks_to_event')}",
-        f"Sikker km-ramme næste uge: {summary['safe_next_week_distance_km']['low']} - {summary['safe_next_week_distance_km']['high']} km",
+        "=== 7-DAGES COACH-FORSLAG ===",
+        "",
+        f"Fase: {plan.get('phase')}",
+        f"Vurdering: {plan.get('week_assessment')}",
+        "",
+        "GARMIN-KALENDER",
     ]
-    if plan.get("weekly_distance_target_km") is not None:
-        lines.append(f"Planlagt distance: {plan.get('weekly_distance_target_km')} km")
-    if plan.get("week_focus"):
-        lines.append(f"Ugens fokus: {plan['week_focus']}")
-    lines.append("")
-    for session in plan.get("sessions", []):
-        lines.append(f"{session.get('date', '')}  [{session.get('type', '')}]")
-        if session.get("session"):
-            lines.append(f"  {session['session']}")
-        if session.get("purpose"):
-            lines.append(f"  Formål: {session['purpose']}")
-        if session.get("intensity"):
-            lines.append(f"  Intensitet: {session['intensity']}")
-        lines.append("")
-    lines.append(f"Coach: {plan.get('coach_note', '')}")
-    lines.append("")
-    lines.append("GARMIN WRITE-BACK: OFF")
+    labels = {"KEEP": "BEHOLD", "MOVE": "FLYT", "ADJUST": "JUSTÉR", "ADD": "TILFØJ", "REMOVE": "FJERN"}
+    for action in plan.get("actions", []):
+        label = labels.get(action["action"], action["action"])
+        source = action.get("source_title") or ""
+        chosen = action.get("selected_template") or {}
+        title = chosen.get("title") or source or action.get("family") or "pas"
+        suffix = ""
+        if action["action"] == "MOVE" and action.get("source_date"):
+            suffix = f" (fra {action['source_date']})"
+        lines.append(f"- {action['date']}: {label} – {title}{suffix}")
+        lines.append(f"    Hvorfor: {action.get('reason')}")
+        if action.get("evidence_tags"):
+            lines.append(f"    Inspirationskilder: {', '.join(action['evidence_tags'])}")
+
+    if plan.get("focus_next_14_days"):
+        lines.extend(["", "FOKUS NÆSTE 14 DAGE"])
+        for item in plan["focus_next_14_days"]:
+            lines.append(f"- {item}")
+
+    lines.extend(["", "STATUS", "- Alle nye/justerede pas er bundet til godkendte Garmin-skabeloner.", "- Garmin write-back: OFF."])
     return "\n".join(lines)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
-    parser.add_argument("--goal", type=Path, default=DEFAULT_GOAL)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--text-output", type=Path, default=DEFAULT_TEXT)
-    parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--no-ai", action="store_true")
-    args = parser.parse_args()
+    state = load(STATE, {})
+    calendar = load(CALENDAR, {})
+    library = load(TEMPLATES, {})
+    knowledge = load(KNOWLEDGE, {})
+    profile = load(PROFILE, {})
+    if not state:
+        print("ERROR: Mangler coach_state.json. Kør coach_brief.py først.")
+        return 2
+    if not template_families(library):
+        print("ERROR: Mangler godkendt workout-bibliotek. Kør workout_style_probe.py og build_template_library.py først.")
+        return 3
 
-    if not args.snapshot.exists():
-        raise SystemExit(f"Snapshot missing: {args.snapshot}")
-    if not args.goal.exists():
-        raise SystemExit(f"Goal missing: {args.goal}")
+    context = build_context(state, calendar, library, knowledge, profile)
+    try:
+        raw = call_model(context)
+        source = "ollama"
+    except Exception as exc:
+        print(f"WARNING: Lokal model kunne ikke lave plan: {exc}")
+        raw = deterministic_fallback(context)
+        source = "fallback"
 
-    snapshot = load_json(args.snapshot)
-    goal = load_json(args.goal)
-    summary = summarize(snapshot, goal)
+    plan = validate(raw, context, library)
+    plan["source"] = source
+    text = render(plan)
 
-    plan: dict[str, Any]
-    if args.no_ai:
-        plan = fallback_plan(summary, goal)
-    else:
-        try:
-            print(f"Asking local Ollama model {args.model} (thinking disabled)...")
-            plan = call_ollama(summary, goal, args.model)
-        except Exception as exc:
-            print(f"WARNING: Local AI unavailable or invalid response: {exc}")
-            print("Using safe deterministic fallback preview instead.")
-            plan = fallback_plan(summary, goal)
-            plan["ai_error"] = str(exc)[:500]
-
-    envelope = summary["safe_next_week_distance_km"]
-    planned = plan.get("weekly_distance_target_km")
-    if planned is not None:
-        try:
-            planned_f = float(planned)
-            if planned_f < envelope["low"] or planned_f > envelope["high"]:
-                plan["weekly_distance_target_km"] = min(max(planned_f, envelope["low"]), envelope["high"])
-                plan["guardrail_adjustment"] = "weekly distance target clamped to safe envelope"
-        except Exception:
-            pass
-
-    result = {"summary": summary, "plan": plan, "garmin_writeback_enabled": False}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    text = render_text(plan, summary)
-    args.text_output.write_text(text, encoding="utf-8")
-
-    print("\n=== COACH PREVIEW ===")
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    TEXT_OUT.write_text(text, encoding="utf-8")
     print(text)
-    print(f"\nJSON saved locally: {args.output}")
-    print(f"Text saved locally: {args.text_output}")
+    print(f"\nJSON: {OUT}")
+    print(f"Tekst: {TEXT_OUT}")
     return 0
 
 
