@@ -65,27 +65,15 @@ function Run-Status([switch]$RefreshTemplates) {
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
     Write-Host "==============================================" -ForegroundColor Green
 
-    # Fail early if the local prerequisites are not trustworthy.
     Run-CoachScript 'coach_doctor.py' @('--mode','preflight') -Required
-
-    # Core data must be fresh. We never continue on an old snapshot when Garmin
-    # login/activity retrieval failed.
     Run-CoachScript 'collect_snapshot.py' @('--days','42') -Required
-
-    # Recovery history is useful but fills gradually to avoid Garmin rate limits.
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
-
-    # Calendar truth is core to plan-vs-completed matching and later write-back.
     Run-CoachScript 'calendar_probe.py' -Required
     Ensure-Templates -Force:$RefreshTemplates
-
-    # Structured analysis first, then a coach-language pass, then the validated plan.
     Run-CoachScript 'coach_brief.py' -Required
     Run-CoachScript 'coach_voice.py' -Required
     Run-CoachScript 'coach_preview_v2.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
-
-    # Postflight catches stale/missing artefacts before the UI trusts them.
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 
     Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
@@ -110,9 +98,9 @@ function Run-Auto {
 Ensure-Dependencies
 $query = (($Text | Where-Object { $_ -ne $null }) -join ' ').Trim()
 
-# A named mutex prevents the browser UI, Windows scheduler and manual commands from
-# hitting Garmin at the same time.
-$mutex = New-Object System.Threading.Mutex($false, 'GarminLocalCoachPipeline')
+# One named mutex across UI, scheduler and manual runs. PowerShell 5.1-compatible
+# constructor syntax is used deliberately because the Acer runs Windows PowerShell 5.1.
+$mutex = New-Object System.Threading.Mutex -ArgumentList $false, 'GarminLocalCoachPipeline'
 $hasLock = $false
 try {
     $hasLock = $mutex.WaitOne(0)
