@@ -1,4 +1,4 @@
-"""Generate a read-only adaptive training preview for the active race goal.
+r"""Generate a read-only adaptive training preview for the active race goal.
 
 Inputs stay local on the Acer PC:
 - C:\GarminCoach\data\snapshot.json (Garmin snapshot)
@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +25,7 @@ DEFAULT_GOAL = Path(__file__).parent / "goals" / "thy-trail-2026.json"
 DEFAULT_OUTPUT = Path(r"C:\GarminCoach\data\coach_preview.json")
 DEFAULT_TEXT = Path(r"C:\GarminCoach\data\coach_preview.txt")
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-MODEL = "qwen3:4b"
+MODEL = "qwen3:1.7b"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -157,8 +156,6 @@ def summarize(snapshot: dict[str, Any], goal: dict[str, Any]) -> dict[str, Any]:
     else:
         phase = "base_build"
 
-    # Conservative volume envelope. The model may move volume within this band,
-    # but should not exceed it without an explicit human-approved goal change.
     reference_km = max(recent["distance_km"], previous["distance_km"], 1.0)
     if recovery_state == "red":
         target_low = reference_km * 0.55
@@ -212,31 +209,31 @@ def fallback_plan(summary: dict[str, Any], goal: dict[str, Any]) -> dict[str, An
     longest = float(summary["last_7_days"].get("longest_run_min") or 60)
 
     if state == "red":
-        quality = "45 min very easy; no intervals"
-        sat = f"{max(50, round(longest * 0.70)):.0f} min easy trail"
-        sun = "Rest or 30 min walk"
+        quality = "45 min meget roligt; ingen intervaller"
+        sat = f"{max(50, round(longest * 0.70)):.0f} min rolig trail"
+        sun = "Hvile eller 30 min gang"
     elif state == "yellow":
-        quality = "45-50 min easy with 4 x 20 s relaxed strides only if legs feel good"
-        sat = f"{max(60, round(longest * 0.90)):.0f} min easy trail, practise fueling"
-        sun = "35-40 min very easy trail on tired legs"
+        quality = "45-50 min roligt med 4 x 20 s lette stigningsløb, kun hvis benene føles gode"
+        sat = f"{max(60, round(longest * 0.90)):.0f} min rolig trail, øv energiindtag"
+        sun = "35-40 min meget rolig trail på trætte ben"
     else:
-        quality = "55-65 min total incl. 6 x 3 min controlled hill effort, easy jog recoveries"
+        quality = "55-65 min i alt inkl. 6 x 3 min kontrolleret bakke, rolig jog som pause"
         if phase in {"specific_build", "race_specific_peak"}:
-            sat = f"{max(75, round(longest * 1.05)):.0f} min easy trail, hills/uneven terrain, practise fueling"
-            sun = "45-55 min easy trail on tired legs; keep intensity low"
+            sat = f"{max(75, round(longest * 1.05)):.0f} min rolig trail, bakker/ujævnt terræn, øv energiindtag"
+            sun = "45-55 min rolig trail på trætte ben; lav intensitet"
         elif phase == "taper":
-            sat = f"{max(55, round(longest * 0.70)):.0f} min easy trail"
-            sun = "30-40 min easy"
+            sat = f"{max(55, round(longest * 0.70)):.0f} min rolig trail"
+            sun = "30-40 min roligt"
         else:
-            sat = f"{max(70, round(longest * 1.05)):.0f} min easy long run"
-            sun = "40-45 min easy"
+            sat = f"{max(70, round(longest * 1.05)):.0f} min rolig lang tur"
+            sun = "40-45 min roligt"
 
     sessions = [
-        {"date": start.isoformat(), "type": "rest", "purpose": "absorb recent training"},
-        {"date": (start + dt.timedelta(days=1)).isoformat(), "type": "easy_run", "session": "45-55 min easy", "purpose": "aerobic maintenance"},
-        {"date": (start + dt.timedelta(days=3)).isoformat(), "type": "quality", "session": quality, "purpose": "hill strength / running economy without excessive fatigue"},
-        {"date": (start + dt.timedelta(days=5)).isoformat(), "type": "long_trail", "session": sat, "purpose": "Thy-specific time on feet and terrain/fueling practice"},
-        {"date": (start + dt.timedelta(days=6)).isoformat(), "type": "back_to_back", "session": sun, "purpose": "day-2 resilience for two-day stage race"},
+        {"date": start.isoformat(), "type": "rest", "purpose": "absorbere den seneste træning"},
+        {"date": (start + dt.timedelta(days=1)).isoformat(), "type": "easy_run", "session": "45-55 min roligt", "purpose": "aerob vedligeholdelse"},
+        {"date": (start + dt.timedelta(days=3)).isoformat(), "type": "quality", "session": quality, "purpose": "bakkestyrke og løbeøkonomi uden unødig træthed"},
+        {"date": (start + dt.timedelta(days=5)).isoformat(), "type": "long_trail", "session": sat, "purpose": "Thy-specifik tid på benene samt terræn- og energiøvelse"},
+        {"date": (start + dt.timedelta(days=6)).isoformat(), "type": "back_to_back", "session": sun, "purpose": "robusthed til dag 2 i etapeløbet"},
     ]
     return {
         "source": "deterministic_fallback",
@@ -245,37 +242,36 @@ def fallback_plan(summary: dict[str, Any], goal: dict[str, Any]) -> dict[str, An
         "recovery_state": state,
         "week_start": start.isoformat(),
         "sessions": sessions,
-        "coach_note": "Preview only. Garmin write-back remains disabled.",
+        "coach_note": "Kun preview. Garmin write-back er fortsat slået fra.",
     }
 
 
 def model_prompt(summary: dict[str, Any], goal: dict[str, Any]) -> str:
-    return f"""You are a conservative endurance running coach planning for ONE athlete.
-The active event is a two-day trail stage race. Use the race goal, current phase,
-recent Garmin-derived training and recovery signals below. The athlete must be
-prepared for 23 km on day 1 and 19 km on day 2, with forest, technical trail,
-gravel, dunes/heath, sand/beach and wind exposure.
+    return f"""Du er en konservativ udholdenhedstræner for EN løber.
+Målet er et todages trail-etapeløb. Brug løbsmålet, den aktuelle fase, de seneste
+Garmin-data og restitutionssignaler nedenfor. Løberen skal forberedes til 23 km
+dag 1 og 19 km dag 2 med skov, teknisk trail, grus, klit/hede, sand/strand og vind.
 
-PRIMARY PRINCIPLES
-- Preserve the purpose of the block: specificity for a two-day trail race.
-- The plan must adapt to current recovery and recent training rather than follow a rigid template.
-- Do not increase total running distance outside the supplied safe distance envelope.
-- Avoid consecutive hard days. Back-to-back weekend running is allowed only when both are easy/moderate; day 2 is specifically about tired-leg resilience.
-- Include trail/uneven-terrain exposure and fueling practice where appropriate.
-- If recovery_state is red, remove quality work and reduce training.
-- If recovery_state is yellow, be cautious and make quality optional or reduced.
-- Training Readiness may be absent; do NOT treat absence as poor readiness.
-- This is PREVIEW ONLY. Never claim anything was written to Garmin.
-- Prefer 4 running days unless recent frequency or recovery makes 3 more sensible.
-- Write concise Danish text inside JSON values.
+REGLER
+- Bevar blokkens formål: specifik forberedelse til et todages trailløb.
+- Tilpas planen til restitution og nylig træning; brug ikke en rigid skabelon.
+- Hold samlet løbedistance inden for den angivne sikre km-ramme.
+- Undgå to hårde dage i træk. Back-to-back weekend er kun rolig/moderat; dag 2 træner løb på trætte ben.
+- Brug trail/ujævnt terræn og energi-/væskeøvelse hvor relevant.
+- Ved red restitution fjernes kvalitet og træningen reduceres.
+- Ved yellow restitution skal kvalitet være reduceret eller valgfri.
+- Manglende Training Readiness er IKKE det samme som dårlig restitution.
+- Dette er KUN PREVIEW. Påstå aldrig at noget er skrevet til Garmin.
+- Foretræk 4 løbedage, medmindre nylig frekvens eller restitution taler for 3.
+- Skriv kort og konkret dansk i JSON-værdierne.
 
-ACTIVE GOAL:
+AKTIVT MÅL:
 {json.dumps(goal, ensure_ascii=False, indent=2)}
 
-CURRENT SUMMARY:
+AKTUEL STATUS:
 {json.dumps(summary, ensure_ascii=False, indent=2)}
 
-Return ONLY valid JSON with this exact top-level structure:
+Returner KUN gyldig JSON med præcis denne topstruktur:
 {{
   "source": "ollama",
   "goal": "...",
@@ -303,14 +299,18 @@ def call_ollama(summary: dict[str, Any], goal: dict[str, Any], model: str) -> di
     payload = {
         "model": model,
         "stream": False,
+        "think": False,
         "format": "json",
         "messages": [
-            {"role": "system", "content": "Return strict JSON only. Be conservative, specific and evidence-driven."},
+            {"role": "system", "content": "Returner kun streng gyldig JSON. Vær konservativ, konkret og datadrevet."},
             {"role": "user", "content": model_prompt(summary, goal)},
         ],
-        "options": {"temperature": 0.2},
+        "options": {
+            "temperature": 0.15,
+            "num_predict": 1200,
+        },
     }
-    response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+    response = requests.post(OLLAMA_URL, json=payload, timeout=180)
     response.raise_for_status()
     body = response.json()
     content = body.get("message", {}).get("content", "")
@@ -373,7 +373,7 @@ def main() -> int:
         plan = fallback_plan(summary, goal)
     else:
         try:
-            print(f"Asking local Ollama model {args.model}...")
+            print(f"Asking local Ollama model {args.model} (thinking disabled)...")
             plan = call_ollama(summary, goal, args.model)
         except Exception as exc:
             print(f"WARNING: Local AI unavailable or invalid response: {exc}")
