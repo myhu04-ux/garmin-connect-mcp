@@ -94,7 +94,7 @@ function Run-Status([switch]$RefreshTemplates) {
 
 function Run-Auto {
     Run-Status
-    Run-CoachScript 'calendar_writer.py' @('--apply') -Required
+    Run-CoachScript 'calendar_writer_safe.py' @('--apply') -Required
     Run-CoachScript 'calendar_probe.py' -Required
     Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
@@ -140,7 +140,7 @@ try {
         'doctor' { Run-CoachScript 'coach_doctor.py' @('--mode','postflight') -Required }
         'test-writeback' {
             Run-Status
-            Run-CoachScript 'calendar_writer.py' @('--test-one') -Required
+            Run-CoachScript 'calendar_writer_safe.py' @('--test-one') -Required
             Run-CoachScript 'calendar_probe.py' -Required
             Build-CoachOutput
             Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
