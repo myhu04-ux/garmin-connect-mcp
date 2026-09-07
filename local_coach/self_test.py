@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 
 from coach_preview_v2 import validate
+from plan_identity import position_for
 from plan_matcher import match_recent_plan
 
 
@@ -47,6 +48,15 @@ def test_strength_matches_strength() -> None:
     assert result["matched"] == 1, result
 
 
+def test_today_unmatched_is_pending() -> None:
+    snapshot = {"all_activities": []}
+    calendar = {"items": [{"date": iso(0), "title": "Let løb - 5 km (Zone 2)", "workout_id": 11}]}
+    result = match_recent_plan(snapshot, calendar, days_back=7)
+    assert result["pending"] == 1, result
+    assert result["missed"] == 0, result
+    assert result["planned_workouts"] == 0, result
+
+
 def base_context(recovery: str = "green") -> dict:
     return {
         "allowed_dates": [iso(1), iso(2), iso(3)],
@@ -54,7 +64,7 @@ def base_context(recovery: str = "green") -> dict:
         "recovery": {"state": recovery},
         "training": {},
         "plan_match": {},
-        "event": {},
+        "event": {"name": "Thy Trail"},
         "event_focus_points": [],
         "existing_calendar": [{
             "date": iso(1),
@@ -64,7 +74,11 @@ def base_context(recovery: str = "green") -> dict:
         }],
         "available_workout_families": {},
         "external_plan_principles": [],
-        "athlete_preferences": {},
+        "athlete_preferences": {
+            "plan_code": "ThyTrail",
+            "plan_anchor_monday": (dt.date.today() - dt.timedelta(days=dt.date.today().weekday())).isoformat(),
+            "plan_anchor_week": 3,
+        },
         "rules": {},
     }
 
@@ -104,12 +118,37 @@ def test_red_blocks_hard_add() -> None:
     assert all(a.get("family") != "quality_interval" for a in plan["actions"]), plan
 
 
+def test_plan_week_day_name() -> None:
+    profile = {"plan_code": "ThyTrail", "plan_anchor_monday": "2026-09-07", "plan_anchor_week": 3}
+    pos = position_for("2026-09-10", profile, {"name": "Thy Trail"})
+    assert pos["name"] == "ThyTrailW3D4", pos
+    next_week = position_for("2026-09-14", profile, {"name": "Thy Trail"})
+    assert next_week["name"] == "ThyTrailW4D1", next_week
+
+
+def test_preview_gets_focus_and_plan_name() -> None:
+    raw = {"actions": [{
+        "action": "KEEP",
+        "source_date": iso(1),
+        "source_workout_id": 11,
+        "date": iso(1),
+        "reason": "Godt placeret roligt pas.",
+    }]}
+    plan = validate(raw, base_context(), library())
+    action = plan["actions"][0]
+    assert action.get("plan_name", "").startswith("ThyTrailW"), action
+    assert action.get("focus"), action
+
+
 def main() -> int:
     tests = [
         test_shifted_run_matches,
         test_strength_matches_strength,
+        test_today_unmatched_is_pending,
         test_invalid_adjust_preserves_existing,
         test_red_blocks_hard_add,
+        test_plan_week_day_name,
+        test_preview_gets_focus_and_plan_name,
     ]
     print("=== GARMIN LOCAL COACH SELF-TEST ===")
     for test in tests:
