@@ -1,15 +1,17 @@
 """Manage the local Ollama models used by Garmin Coach.
 
-PARSER_MODEL is internal only. CHAT_MODEL handles ordinary free-form conversation when
-no deterministic tool can answer. COACH_MODEL is reserved for deep synthesis, weekly
-planning, goal research and adaptive planning. Downloads are local/free and serialized
-so the Acer does not try to download two multi-GB models concurrently.
+PARSER_MODEL is internal only. CHAT_MODEL is a dedicated instruct model for ordinary
+free-form conversation. COACH_MODEL is reserved for deep synthesis, weekly planning,
+goal research and adaptive planning. Downloads are local/free, serialized, and guarded
+by a disk-space check so the Acer does not fill its system drive unexpectedly.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -21,8 +23,9 @@ import core_evidence
 OLLAMA_ROOT = "http://127.0.0.1:11434"
 PARSER_MODEL = "qwen3:1.7b"
 FAST_MODEL = PARSER_MODEL
-CHAT_MODEL = "qwen3:4b"
+CHAT_MODEL = "qwen3:4b-instruct"
 COACH_MODEL = "qwen3:8b"
+MODEL_SIZE_GB = {CHAT_MODEL: 2.5, COACH_MODEL: 5.2}
 STATUS = Path(r"C:\GarminCoach\data\model_status.json")
 _THREADS: dict[str, threading.Thread] = {}
 _THREADS_LOCK = threading.Lock()
@@ -91,14 +94,56 @@ def is_installed(model: str) -> bool:
     return model in names or f"{model}:latest" in names
 
 
+def _disk_probe_path() -> Path:
+    configured = os.environ.get("OLLAMA_MODELS")
+    if configured:
+        path = Path(configured).expanduser()
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        if path.exists():
+            return path
+    home = Path.home()
+    return Path(home.anchor) if home.anchor else home
+
+
+def free_disk_gb() -> float | None:
+    try:
+        return round(shutil.disk_usage(_disk_probe_path()).free / (1024 ** 3), 1)
+    except Exception:
+        return None
+
+
+def disk_ready_for(model: str) -> tuple[bool, str]:
+    free = free_disk_gb()
+    if free is None:
+        return True, "Diskplads kunne ikke måles; Ollama får lov at afgøre download."
+    expected = float(MODEL_SIZE_GB.get(model, 0.0))
+    # Keep room for temporary download data and normal Windows operation.
+    required = expected + 3.0
+    if free < required:
+        return False, (
+            f"Der er kun ca. {free:g} GB fri plads på Ollamas drev. "
+            f"Jeg vil have mindst ca. {required:g} GB fri før {model} downloades."
+        )
+    return True, f"Disk OK: ca. {free:g} GB fri."
+
+
 def pull_model(model: str) -> None:
     with _DOWNLOAD_LOCK:
-        _save_model(model, {"state": "checking", "progress_pct": 0})
+        _save_model(model, {"state": "checking", "progress_pct": 0, "free_disk_gb": free_disk_gb()})
         try:
             if is_installed(model):
-                _save_model(model, {"state": "ready", "progress_pct": 100})
+                _save_model(model, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
                 return
-            _save_model(model, {"state": "downloading", "progress_pct": 0})
+            disk_ok, disk_message = disk_ready_for(model)
+            if not disk_ok:
+                raise RuntimeError(disk_message)
+            _save_model(model, {
+                "state": "downloading",
+                "progress_pct": 0,
+                "detail": disk_message,
+                "free_disk_gb": free_disk_gb(),
+            })
             with requests.post(
                 f"{OLLAMA_ROOT}/api/pull",
                 json={"model": model, "stream": True},
@@ -127,18 +172,19 @@ def pull_model(model: str) -> None:
                         "state": "downloading",
                         "progress_pct": last_pct,
                         "detail": last_status,
+                        "free_disk_gb": free_disk_gb(),
                     })
             if not is_installed(model):
                 raise RuntimeError("Ollama afsluttede download, men modellen kan ikke findes i /api/tags.")
-            _save_model(model, {"state": "ready", "progress_pct": 100})
+            _save_model(model, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
         except Exception as exc:
-            _save_model(model, {"state": "error", "error": str(exc)[:500]})
+            _save_model(model, {"state": "error", "error": str(exc)[:500], "free_disk_gb": free_disk_gb()})
 
 
 def ensure_model_background(model: str) -> dict[str, Any]:
     try:
         if is_installed(model):
-            _save_model(model, {"state": "ready", "progress_pct": 100})
+            _save_model(model, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
             return status(model)
     except Exception:
         pass
@@ -155,7 +201,7 @@ def _ready(model: str, label: str) -> tuple[bool, str]:
     if is_installed(model):
         current = status(model)
         if current.get("state") != "ready":
-            _save_model(model, {"state": "ready", "progress_pct": 100})
+            _save_model(model, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
         return True, model
     current = ensure_model_background(model)
     state = current.get("state") or "downloading"
@@ -183,17 +229,12 @@ def ensure_coach_model_background() -> dict[str, Any]:
 
 
 def ensure_all_models_background() -> None:
-    """Prepare 4B first, then 8B, in one background worker.
-
-    This function itself may block while downloading, so callers should run it in a
-    daemon/background thread (the chat agent does). A user request can still trigger a
-    missing model independently; _DOWNLOAD_LOCK keeps actual downloads serialized.
-    """
+    """Prepare 4B instruct first, then 8B, in one background worker."""
     if not is_installed(CHAT_MODEL):
         pull_model(CHAT_MODEL)
     else:
-        _save_model(CHAT_MODEL, {"state": "ready", "progress_pct": 100})
+        _save_model(CHAT_MODEL, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
     if not is_installed(COACH_MODEL):
         pull_model(COACH_MODEL)
     else:
-        _save_model(COACH_MODEL, {"state": "ready", "progress_pct": 100})
+        _save_model(COACH_MODEL, {"state": "ready", "progress_pct": 100, "free_disk_gb": free_disk_gb()})
