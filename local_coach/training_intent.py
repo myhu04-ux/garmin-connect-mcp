@@ -114,10 +114,21 @@ def deterministic(message: str) -> dict[str, Any]:
     calendar_move = any(k in text for k in (
         "flyt den", "flyt løbet", "flyt test", "ryk den", "ryk løbet"
     )) and (target_date is not None or "kalender" in text)
-    calendar_add = any(k in text for k in (
-        "læg den i kalender", "læg løbet i kalender", "læg test", "planlæg den", "planlaeg den",
-        "sæt den i kalender", "saet den i kalender", "schedule"
-    ))
+
+    # Calendar placement should be deterministic and never require Qwen. Accept the
+    # ordinary wording the athlete is likely to use, including mixed Danish/English
+    # verbs such as "put den i kalenderen på torsdag".
+    placement_verbs = (
+        "læg den", "laeg den", "læg løbet", "laeg løbet", "læg test", "laeg test",
+        "sæt den", "saet den", "sæt løbet", "saet løbet",
+        "put den", "put løbet", "put test", "putte den",
+        "placer den", "placér den", "placer løbet", "placér løbet",
+        "planlæg den", "planlaeg den", "schedule den", "schedule",
+        "kom den i kalender", "smid den i kalender",
+    )
+    calendar_add = any(k in text for k in placement_verbs) and (
+        "kalender" in text or target_date is not None
+    )
 
     refers_to_plan = any(k in text for k in ("planen", "ugen", "næste uge", "hele planen"))
     followup_delete = (not refers_to_plan) and any(k in text for k in (
@@ -221,6 +232,7 @@ def _clean(candidate: Any, fallback: dict[str, Any]) -> dict[str, Any]:
 
 def interpret(message: str, use_model: bool = True) -> dict[str, Any]:
     base = deterministic(message)
+    # Clear action/objective requests do not need an LLM roundtrip.
     if not use_model or base["operation"] != "training_question" or base["objective"] != "general":
         return base
 
@@ -240,8 +252,8 @@ def interpret(message: str, use_model: bool = True) -> dict[str, Any]:
     }
     prompt = (
         "Fortolk brugerens danske besked som træner-intent. Returner KUN ét JSON-objekt, ingen markdown. "
-        "Gæt ikke på tal eller datoer, som brugeren ikke har angivet. Samtale om et mål er training_question; "
-        "Garmin-write kræver at brugeren tydeligt beder om at oprette, ændre, slette eller kalenderplacere testpasset. "
+        "Gæt ikke på tal eller datoer, som brugeren ikke har angivet. 'Jeg vil forbedre VO2-maks' betyder "
+        "objective=vo2max, men er normalt training_question medmindre brugeren udtrykkeligt beder om handling. "
         f"Tilladt schema: {json.dumps(schema, ensure_ascii=False)}\nBESKED={message[:1200]}"
     )
     try:
