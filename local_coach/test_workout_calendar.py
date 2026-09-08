@@ -15,6 +15,7 @@ from typing import Any
 
 from garminconnect import Garmin
 
+import calendar_consistency
 from calendar_probe import extract_items
 
 ROOT = Path(r"C:\GarminCoach")
@@ -84,6 +85,14 @@ def entry_for(api: Garmin, workout_id: Any, day: dt.date) -> dict[str, Any] | No
     return None
 
 
+def entry_for_sid(api: Garmin, workout_id: Any, day: dt.date, scheduled_id: Any) -> dict[str, Any] | None:
+    expected = str(scheduled_id or "")
+    row = entry_for(api, workout_id, day)
+    if row and str(row.get("scheduled_workout_id") or "") == expected:
+        return row
+    return None
+
+
 def entries_for_workout(api: Garmin, workout_id: Any, dates: list[dt.date]) -> list[dict[str, Any]]:
     wid = str(workout_id or "")
     months = sorted({(d.year, d.month) for d in dates})
@@ -107,6 +116,19 @@ def active_state() -> dict[str, Any]:
     return state
 
 
+def wait_for_entry(api: Garmin, workout_id: Any, day: dt.date) -> dict[str, Any] | None:
+    ok, value = calendar_consistency.wait_present(lambda: entry_for(api, workout_id, day))
+    return value if ok and isinstance(value, dict) else None
+
+
+def wait_for_old_sid_to_disappear(api: Garmin, workout_id: Any, day: dt.date, scheduled_id: Any) -> bool:
+    ok, _ = calendar_consistency.wait_absent(
+        lambda: entry_for_sid(api, workout_id, day, scheduled_id),
+        attempts=8,
+    )
+    return ok
+
+
 def schedule_or_move(target_date: str) -> dict[str, Any]:
     state = active_state()
     day = validate_target(target_date)
@@ -120,14 +142,15 @@ def schedule_or_move(target_date: str) -> dict[str, Any]:
     if already and (not old_sid or str(already.get("scheduled_workout_id") or "") == str(old_sid)):
         state["scheduled_date"] = day.isoformat()
         state["scheduled_workout_id"] = already.get("scheduled_workout_id")
+        state["calendar_verified_at"] = dt.datetime.now().astimezone().isoformat()
         save(STATE, state)
         return {"action": "already_scheduled", "date": day.isoformat(), "name": state.get("name")}
 
     if not already:
         api.schedule_workout(wid, day.isoformat())
-        already = entry_for(api, wid, day)
+        already = wait_for_entry(api, wid, day)
         if not already:
-            raise RuntimeError("Garmin svarede på schedule-kaldet, men testpasset kunne ikke findes igen på datoen.")
+            raise RuntimeError("Garmin accepterede schedule-kaldet, men placeringen blev ikke synlig ved gentaget read-back.")
 
     new_sid = already.get("scheduled_workout_id")
 
@@ -136,7 +159,6 @@ def schedule_or_move(target_date: str) -> dict[str, Any]:
         try:
             api.unschedule_workout(old_sid)
         except Exception as exc:
-            # Roll back the newly created placement so failure does not leave duplicates.
             if new_sid:
                 try:
                     api.unschedule_workout(new_sid)
@@ -144,15 +166,15 @@ def schedule_or_move(target_date: str) -> dict[str, Any]:
                     pass
             raise RuntimeError(f"Det nye pas blev oprettet, men den gamle kalenderpost kunne ikke fjernes; ændringen blev forsøgt rullet tilbage: {exc}") from exc
 
-        if old_date:
-            old_after = entry_for(api, wid, old_date)
-            if old_after and str(old_after.get("scheduled_workout_id") or "") == str(old_sid):
-                if new_sid:
-                    try:
-                        api.unschedule_workout(new_sid)
-                    except Exception:
-                        pass
-                raise RuntimeError("Garmin read-back viser stadig den gamle kalenderpost; den nye placering blev rullet tilbage.")
+        if old_date and not wait_for_old_sid_to_disappear(api, wid, old_date, old_sid):
+            if new_sid:
+                try:
+                    api.unschedule_workout(new_sid)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                "Garmin viser stadig den gamle kalenderpost efter flere read-back-forsøg; den nye placering blev rullet tilbage."
+            )
 
     state["scheduled_date"] = day.isoformat()
     state["scheduled_workout_id"] = new_sid
@@ -187,9 +209,14 @@ def unschedule() -> dict[str, Any]:
     for sid in ids:
         api.unschedule_workout(sid)
 
-    verify_rows = entries_for_workout(api, wid, dates)
-    if verify_rows:
-        raise RuntimeError("Garmin read-back viser stadig mindst én kalenderpost for testpasset.")
+    ok, verify_rows = calendar_consistency.wait_absent(
+        lambda: entries_for_workout(api, wid, dates),
+        attempts=8,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"Garmin read-back viser stadig {len(verify_rows or [])} kalenderpost(er) for testpasset efter gentagne forsøg."
+        )
 
     state.pop("scheduled_date", None)
     state.pop("scheduled_workout_id", None)
