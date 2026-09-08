@@ -10,6 +10,7 @@ $chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $intentTest = Join-Path $repo 'local_coach\intent_self_test.py'
+$routerTest = Join-Path $repo 'local_coach\router_self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
@@ -19,6 +20,7 @@ if (-not (Test-Path $coach)) { throw "Mangler coach-motor: $coach" }
 if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
 if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
 if (-not (Test-Path $intentTest)) { throw "Mangler intent-selftest: $intentTest" }
+if (-not (Test-Path $routerTest)) { throw "Mangler router-selftest: $routerTest" }
 
 Write-Host "`n1/6 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
 & $python -m pip install -e $repo
@@ -46,6 +48,8 @@ Write-Host "`n3/6 Kører offline sikkerheds- og sprogtests..." -ForegroundColor 
 if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. Den gamle UI stoppes ikke.' }
 & $python $intentTest
 if ($LASTEXITCODE -ne 0) { throw 'Coachens sprog/workout-intent tests fejlede. Den gamle UI stoppes ikke.' }
+& $python $routerTest
+if ($LASTEXITCODE -ne 0) { throw 'Coachens naturlige samtalerouting fejlede. Den gamle UI stoppes ikke.' }
 
 Write-Host "`n4/6 Installerer automatisk coach, dashboard og direkte chat..." -ForegroundColor Cyan
 try {
@@ -105,4 +109,4 @@ Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
 Write-Host 'Coach-chatten kan søge read-only i Garmin, forstå træningsmål og ved eksplicit besked oprette/justere ét test-workout under Garmin Træninger.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
-Write-Host 'Automatisk kalender-writeback er fortsat låst; test-workout-chatten skriver kun under Garmin Træninger.' -ForegroundColor Yellow
+Write-Host 'Automatisk kalender-writeback er fortsat låst; test-workout-chatten kan kun ændre det aktive test-workout og dets egen kalenderplacering.' -ForegroundColor Yellow
