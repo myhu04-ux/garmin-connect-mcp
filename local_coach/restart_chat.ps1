@@ -8,12 +8,14 @@ $chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $routerTest = Join-Path $repo 'local_coach\router_self_test.py'
 $compatTest = Join-Path $repo 'local_coach\compat_self_test.py'
+$calendarWriterTest = Join-Path $repo 'local_coach\calendar_writer_self_test.py'
 
 if (-not (Test-Path $python)) { throw "Mangler Python: $python" }
 if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
 if (-not (Test-Path $selfTest)) { throw "Mangler self-test: $selfTest" }
 if (-not (Test-Path $routerTest)) { throw "Mangler router self-test: $routerTest" }
 if (-not (Test-Path $compatTest)) { throw "Mangler compatibility self-test: $compatTest" }
+if (-not (Test-Path $calendarWriterTest)) { throw "Mangler calendar-writer self-test: $calendarWriterTest" }
 
 Write-Host 'Kører hurtig coach-chat selvtest...' -ForegroundColor Cyan
 & $python $selfTest
@@ -26,6 +28,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Coachens samtalerouter fejlede. Den gamle chat
 Write-Host 'Tester kompatibilitet med Garmin-klient uden update_workout...' -ForegroundColor Cyan
 & $python $compatTest
 if ($LASTEXITCODE -ne 0) { throw 'Coachens Garmin-kompatibilitetstest fejlede. Den gamle chat beholdes.' }
+
+Write-Host 'Tester kalendertransaktion og forsinket Garmin read-back...' -ForegroundColor Cyan
+& $python $calendarWriterTest
+if ($LASTEXITCODE -ne 0) { throw 'Coachens kalendertransaktionstest fejlede. Den gamle chat beholdes.' }
 
 Write-Host 'Genstarter kun coach-chatten...' -ForegroundColor Cyan
 try {
