@@ -9,9 +9,14 @@ access to use the principles.
 
 from __future__ import annotations
 
+import datetime as dt
+import json
+from pathlib import Path
 from typing import Any
 
 VERSION = "2026-09-08"
+REFERENCE_INPUT = "__core_evidence_systematic_reviews__"
+TRAINING_KNOWLEDGE = Path(r"C:\GarminCoach\data\training_knowledge.json")
 
 
 def principles() -> list[dict[str, Any]]:
@@ -130,3 +135,77 @@ def merge_into(context: dict[str, Any]) -> dict[str, Any]:
     context["core_evidence_version"] = VERSION
     context.setdefault("rules", {})["personal_data_and_event_override_core_evidence"] = True
     return context
+
+
+def _load_knowledge(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _reference_payload() -> dict[str, Any]:
+    rows = principles()
+    sources = []
+    for index, row in enumerate(rows, start=1):
+        sources.append({
+            "source_id": index,
+            "title": row.get("reference"),
+            "url": row.get("source"),
+            "domain": "pubmed.ncbi.nlm.nih.gov",
+            "pmid": row.get("pmid"),
+        })
+    return {
+        "reference_name": f"Garmin Coach core evidence {VERSION}",
+        "reference_input": REFERENCE_INPUT,
+        "target_event": "general_endurance_running",
+        "intended_athlete": "endurance runner; principles require individual adaptation",
+        "source_quality": "high",
+        "core_evidence_version": VERSION,
+        "principles": [
+            {
+                "principle": row.get("principle"),
+                "category": row.get("category"),
+                "evidence": row.get("evidence"),
+                "source_ids": [index],
+                "confidence": row.get("confidence"),
+            }
+            for index, row in enumerate(rows, start=1)
+        ],
+        "numeric_patterns": [],
+        "cautions": [
+            "Personlige Garmin-data, løbsmål, restitution og sikker progression har højere prioritet end generelle evidensprincipper.",
+            "Principperne må ikke bruges som medicinsk diagnose eller som rigid ugeplan.",
+        ],
+        "sources": sources,
+        "researched_at": VERSION + "T00:00:00+02:00",
+        "mode": "curated_systematic_review_principles",
+    }
+
+
+def seed_training_knowledge(path: Path = TRAINING_KNOWLEDGE) -> bool:
+    """Ensure core evidence exists beside user-supplied plan references.
+
+    Returns True only when the file needed a write. User-researched references are
+    preserved. The core reference is replaced atomically at the JSON-object level,
+    never duplicated.
+    """
+    library = _load_knowledge(path)
+    refs = library.get("references") if isinstance(library.get("references"), list) else []
+    refs = [row for row in refs if isinstance(row, dict)]
+    desired = _reference_payload()
+    current = next((row for row in refs if row.get("reference_input") == REFERENCE_INPUT), None)
+    if current == desired:
+        return False
+    refs = [row for row in refs if row.get("reference_input") != REFERENCE_INPUT]
+    refs.insert(0, desired)
+    payload = {
+        "updated_at": dt.datetime.now().astimezone().isoformat(),
+        "references": refs,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
