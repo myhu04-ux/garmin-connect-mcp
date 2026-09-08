@@ -56,6 +56,24 @@ def test_put_phrase() -> None:
     assert result["target_date"], result
 
 
+def test_full_delete_natural_phrase() -> None:
+    result = conversation_router.route("Du skal slette træningen helt")
+    assert result["delete_workout"], result
+    assert result["calendar_operation"] is None, result
+
+
+def test_full_delete_short_reference() -> None:
+    result = conversation_router.route("Fjern den helt fra Garmin")
+    assert result["delete_workout"], result
+    assert result["calendar_operation"] is None, result
+
+
+def test_calendar_delete_stays_calendar_only() -> None:
+    result = conversation_router.route("Slet træningen fra kalenderen")
+    assert result["calendar_operation"] == "unschedule_test_workout", result
+    assert not result["delete_workout"], result
+
+
 def main() -> int:
     tests = [
         test_user_move_phrase,
@@ -64,6 +82,9 @@ def main() -> int:
         test_terse_edit_followup,
         test_destination_wins_over_source,
         test_put_phrase,
+        test_full_delete_natural_phrase,
+        test_full_delete_short_reference,
+        test_calendar_delete_stays_calendar_only,
     ]
     print("=== COACH ROUTER SELF-TEST ===")
     for test in tests:
