@@ -20,7 +20,6 @@ $gitCandidates = @(
     "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"
 )
 $git = $gitCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-
 New-Item -ItemType Directory -Force -Path $data | Out-Null
 
 function Save-Status([string]$State, [string]$Message, [string]$OldSha = '', [string]$NewSha = '') {
@@ -37,22 +36,19 @@ function Fail-And-Rollback([string]$Message, [string]$OldSha) {
     try {
         if ($OldSha) {
             & $git -C $repo reset --hard $OldSha | Out-Null
-            & $python -m pip install -e $repo | Out-Null
+            & $python -m pip install --upgrade -e $repo | Out-Null
         }
     } catch {}
     Save-Status 'failed_rolled_back' $Message $OldSha $OldSha
     throw $Message
 }
 
-if ($StartupCheck) {
-    Start-Sleep -Seconds 8
-}
+if ($StartupCheck) { Start-Sleep -Seconds 8 }
 
 if (-not $git) { Save-Status 'failed' 'git.exe blev ikke fundet.'; throw 'git.exe blev ikke fundet.' }
 if (-not (Test-Path $python)) { Save-Status 'failed' 'Python-miljø mangler.'; throw "Python-miljø mangler: $python" }
 if (-not (Test-Path $repo)) { Save-Status 'failed' 'Projektmappen mangler.'; throw "Projektmappe mangler: $repo" }
 
-# Never overwrite local edits. A self-update is only safe from a clean checkout.
 $dirty = @(& $git -C $repo status --porcelain)
 if ($dirty.Count -gt 0) {
     Save-Status 'blocked_dirty_repo' 'Selvopdatering blev stoppet, fordi repoet har lokale ændringer.'
@@ -61,22 +57,29 @@ if ($dirty.Count -gt 0) {
 
 $oldSha = (& $git -C $repo rev-parse HEAD).Trim()
 Save-Status 'checking' 'Tjekker GitHub for en nyere coach-version.' $oldSha ''
-
 & $git -C $repo fetch origin $branch --quiet
 if ($LASTEXITCODE -ne 0) { Save-Status 'failed' 'Git fetch fejlede.' $oldSha ''; throw 'Git fetch fejlede.' }
 $remoteSha = (& $git -C $repo rev-parse "origin/$branch").Trim()
 
 if ($remoteSha -eq $oldSha) {
-    Save-Status 'current' 'Coachen er allerede opdateret.' $oldSha $remoteSha
+    # Dependencies can still need reconciliation after a dependency-pin change.
+    & $python -m pip install --upgrade -e $repo | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Afhængigheder kunne ikke synkroniseres.' }
+    $cap = Join-Path $repo 'local_coach\garmin_capability_self_test.py'
+    if (Test-Path $cap) {
+        & $python $cap
+        if ($LASTEXITCODE -ne 0) { throw 'Garmin-klientens native kapabiliteter mangler.' }
+    }
+    Save-Status 'current' 'Coachen og afhængighederne er opdaterede.' $oldSha $remoteSha
     exit 0
 }
 
 & $git -C $repo pull --ff-only origin $branch
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Git pull fejlede; gammel version er bevaret.' $oldSha }
 $newSha = (& $git -C $repo rev-parse HEAD).Trim()
-Save-Status 'testing' 'Ny version hentet. Kører syntaks- og sikkerhedstests.' $oldSha $newSha
+Save-Status 'testing' 'Ny version hentet. Opgraderer fastlåste afhængigheder og kører tests.' $oldSha $newSha
 
-& $python -m pip install -e $repo | Out-Null
+& $python -m pip install --upgrade -e $repo | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Afhængigheder kunne ikke opdateres; rullet tilbage.' $oldSha }
 
 $coachDir = Join-Path $repo 'local_coach'
@@ -86,21 +89,20 @@ foreach ($file in Get-ChildItem -Path $coachDir -Filter '*.py' -File) {
 }
 
 $tests = @(
+    'garmin_capability_self_test.py',
     'self_test.py',
     'intent_self_test.py',
     'router_self_test.py',
-    'compat_self_test.py',
-    'calendar_transaction_self_test.py'
+    'calendar_writer_self_test.py'
 )
 foreach ($name in $tests) {
     $path = Join-Path $coachDir $name
-    if (-not (Test-Path $path)) { continue }
+    if (-not (Test-Path $path)) { Fail-And-Rollback "$name mangler; rullet tilbage." $oldSha }
     & $python $path
     if ($LASTEXITCODE -ne 0) { Fail-And-Rollback "$name fejlede; ny version blev rullet tilbage." $oldSha }
 }
 
 Save-Status 'restarting' 'Tests bestået. Genstarter dashboard og coach-chat.' $oldSha $newSha
-
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_agent.py*') } |
@@ -126,7 +128,7 @@ for ($i = 0; $i -lt 25; $i++) {
 }
 
 if (-not $dashboardReady -or -not $chatReady) {
-    Save-Status 'updated_restart_warning' 'Koden blev opdateret og tests bestod, men en lokal webservice blev ikke klar i tide.' $oldSha $newSha
+    Save-Status 'updated_restart_warning' 'Koden og tests er OK, men en lokal webservice blev ikke klar i tide.' $oldSha $newSha
     exit 3
 }
 
