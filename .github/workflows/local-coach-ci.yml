@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  pure-python-regression:
+  windows-regression:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,10 +33,15 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Compile failed: $($_.Name)" }
           }
 
-      - name: Run pure offline coach regressions
+      - name: Run full offline coach regression suite
         shell: pwsh
         run: |
           $tests = @(
+            'garmin_capability_self_test.py',
+            'self_test.py',
+            'intent_self_test.py',
+            'router_self_test.py',
+            'calendar_writer_self_test.py',
             'shadow_week_self_test.py',
             'coach_benchmark_self_test.py',
             'coach_routing_self_test.py',
