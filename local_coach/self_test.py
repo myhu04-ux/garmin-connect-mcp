@@ -13,7 +13,8 @@ from coach_preview_v2 import decorate, validate
 from named_workout import sanitized_copy
 from plan_identity import position_for
 from plan_matcher import match_recent_plan
-from workout_lab import semantic_signature, validation_errors
+from training_intent import deterministic, parse_target_date
+from workout_lab import normalized_signature, semantic_signature, signature_differences, validation_errors
 
 
 def iso(days: int) -> str:
@@ -252,6 +253,77 @@ def test_workout_lab_accepts_running_structure() -> None:
     assert sig["steps"][1]["end_value"] == 5000.0, sig
 
 
+def test_garmin_metadata_normalization_is_not_execution_change() -> None:
+    before = {
+        "sport_type_key": "running",
+        "segment_count": 1,
+        "steps": [{
+            "order": 1,
+            "dto": "ExecutableStepDTO",
+            "step_type": "interval",
+            "end_condition": "time",
+            "end_value": 240.0,
+            "target_type": None,
+            "target_low": None,
+            "target_high": None,
+            "zone_number": None,
+            "iterations": None,
+            "category": None,
+            "exercise_name": None,
+            "weight_value": None,
+            "description": "vores tekst",
+        }],
+    }
+    after = {
+        "sport_type_key": "running",
+        "segment_count": 1,
+        "steps": [{
+            "order": 99,
+            "dto": "ExecutableStepDTO",
+            "step_type": "interval",
+            "end_condition": "time",
+            "end_value": 240,
+            "target_type": "no.target",
+            "target_low": 0,
+            "target_high": 0,
+            "zone_number": None,
+            "iterations": None,
+            "category": None,
+            "exercise_name": None,
+            "weight_value": 0,
+            "description": "Garmin normaliserede teksten",
+        }],
+    }
+    expected = normalized_signature(before)
+    actual = normalized_signature(after)
+    assert signature_differences(expected, actual) == [], (expected, actual)
+
+
+def test_natural_test_workout_intents() -> None:
+    created = deterministic("lav et testløb der skal forbedre min VO2 maks")
+    assert created["operation"] == "create_test_workout", created
+    assert created["objective"] == "vo2max", created
+    shorter = deterministic("gør den 10 minutter kortere")
+    assert shorter["operation"] == "update_test_workout", shorter
+    assert shorter["relative_minutes"] == -10, shorter
+    repeats = deterministic("skift til 5 x 3 min")
+    assert repeats["operation"] == "update_test_workout", repeats
+    assert repeats["repetitions"] == 5 and repeats["work_min"] == 3, repeats
+
+
+def test_natural_calendar_intents() -> None:
+    today = dt.date(2026, 9, 8)  # Tuesday
+    assert parse_target_date("læg den på torsdag", today) == "2026-09-10"
+    schedule = deterministic("læg den i kalenderen på torsdag")
+    assert schedule["operation"] == "schedule_test_workout", schedule
+    assert schedule["target_date"], schedule
+    move = deterministic("flyt den til fredag")
+    assert move["operation"] == "move_test_workout", move
+    assert move["target_date"], move
+    remove = deterministic("fjern den fra kalenderen")
+    assert remove["operation"] == "unschedule_test_workout", remove
+
+
 def main() -> int:
     tests = [
         test_shifted_run_matches,
@@ -265,6 +337,9 @@ def main() -> int:
         test_named_clone_sanitizes_without_mutating_master,
         test_in_progress_badge_shape_is_detected,
         test_workout_lab_accepts_running_structure,
+        test_garmin_metadata_normalization_is_not_execution_change,
+        test_natural_test_workout_intents,
+        test_natural_calendar_intents,
     ]
     print("=== GARMIN LOCAL COACH SELF-TEST ===")
     for test in tests:
