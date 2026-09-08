@@ -11,8 +11,10 @@ $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
 $data = Join-Path $root 'data'
 $statusFile = Join-Path $data 'self_update_status.json'
 $branch = 'feature/local-training-coach'
-$ui = Join-Path $repo 'local_coach\coach_ui.py'
-$chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
+$coachDir = Join-Path $repo 'local_coach'
+$testManifest = Join-Path $coachDir 'regression_tests.txt'
+$ui = Join-Path $coachDir 'coach_ui.py'
+$chat = Join-Path $coachDir 'coach_chat_agent.py'
 
 $gitCandidates = @(
     'C:\Program Files\Git\cmd\git.exe',
@@ -43,8 +45,16 @@ function Fail-And-Rollback([string]$Message, [string]$OldSha) {
     throw $Message
 }
 
+function Regression-TestNames {
+    if (-not (Test-Path $testManifest)) { throw "Regressionstest-manifest mangler: $testManifest" }
+    return @(
+        Get-Content -Path $testManifest |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith('#') }
+    )
+}
+
 function Invoke-CoachTests([string]$OldSha) {
-    $coachDir = Join-Path $repo 'local_coach'
     foreach ($file in Get-ChildItem -Path $coachDir -Filter '*.py' -File) {
         & $python -m py_compile $file.FullName
         if ($LASTEXITCODE -ne 0) {
@@ -53,20 +63,7 @@ function Invoke-CoachTests([string]$OldSha) {
         }
     }
 
-    $tests = @(
-        'garmin_capability_self_test.py',
-        'self_test.py',
-        'intent_self_test.py',
-        'router_self_test.py',
-        'calendar_writer_self_test.py',
-        'shadow_week_self_test.py',
-        'coach_benchmark_self_test.py',
-        'coach_routing_self_test.py',
-        'core_evidence_self_test.py',
-        'planned_workout_compiler_self_test.py',
-        'writeback_transaction_self_test.py'
-    )
-    foreach ($name in $tests) {
+    foreach ($name in Regression-TestNames) {
         $path = Join-Path $coachDir $name
         if (-not (Test-Path $path)) {
             if ($OldSha) { Fail-And-Rollback "$name mangler; rullet tilbage." $OldSha }
@@ -102,7 +99,7 @@ if ($remoteSha -eq $oldSha) {
     & $python -m pip install --upgrade -e $repo | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Afhængigheder kunne ikke synkroniseres.' }
     Invoke-CoachTests ''
-    Save-Status 'current' 'Coachen, afhængighederne og benchmark-tests er opdaterede.' $oldSha $remoteSha
+    Save-Status 'current' 'Coachen, afhængighederne og hele regressionssuiten er opdaterede.' $oldSha $remoteSha
     exit 0
 }
 
@@ -146,6 +143,6 @@ if (-not $dashboardReady -or -not $chatReady) {
     exit 3
 }
 
-Save-Status 'updated' 'Coachen er opdateret, benchmark-testet og genstartet. 4B/8B modellerne klargøres i baggrunden.' $oldSha $newSha
+Save-Status 'updated' 'Coachen er opdateret, regressionstestet og genstartet. 4B/8B modellerne klargøres i baggrunden.' $oldSha $newSha
 if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:8766/' }
 exit 0
