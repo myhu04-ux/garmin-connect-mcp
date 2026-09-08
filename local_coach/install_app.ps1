@@ -6,7 +6,7 @@ $python = Join-Path $root '.venv\Scripts\python.exe'
 $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
 $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
-$chat = Join-Path $repo 'local_coach\coach_chat_fast.py'
+$chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
@@ -55,7 +55,7 @@ try {
 Write-Host "`n5/6 Genstarter dashboard og coach-chat sikkert..." -ForegroundColor Cyan
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_fast.py*') } |
+        Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_fast.py*' -or $_.CommandLine -like '*local_coach*coach_chat_agent.py*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 } catch {
     Write-Host "ADVARSEL: Kunne ikke stoppe gammel UI automatisk: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -99,6 +99,6 @@ Start-Process 'http://127.0.0.1:8765/'
 Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
-Write-Host 'Der er også oprettet en skrivebordsgenvej til coach-chatten.'
+Write-Host 'Coach-chatten kan nu søge read-only i Garmin-metodekataloget, opdatere challenges og inspicere workout-format.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
 Write-Host 'Garmin write-back er fortsat låst indtil én kalenderændring er testet fra UI.' -ForegroundColor Yellow
