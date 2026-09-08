@@ -28,6 +28,13 @@ import training_intent
 import workout_selfheal
 
 
+def stage(text: str, model: str | None = None) -> None:
+    """Expose useful progress to the local chat UI without coupling logic to the UI."""
+    setter = getattr(fast.base, "set_chat_stage", None)
+    if callable(setter):
+        setter(text, model)
+
+
 def wants_self_update(message: str) -> bool:
     text = " ".join(message.casefold().strip().split())
     phrases = (
@@ -41,6 +48,7 @@ def wants_self_update(message: str) -> bool:
 
 
 def start_self_update() -> str:
+    stage("Starter sikker selvopdatering…")
     script = Path(__file__).with_name("self_update.ps1")
     if not script.exists():
         return "Selvopdateringsscriptet mangler endnu. Kør den seneste installation én gang manuelt."
@@ -86,6 +94,12 @@ def wants_shadow_week(message: str) -> bool:
 
 
 def shadow_week_answer(message: str) -> str:
+    match = re.search(r"\buge\s*(\d{1,2})\b", message.casefold())
+    week = match.group(1) if match else "den valgte uge"
+    stage(
+        f"8B ekspert analyserer trænings- og helbredstrends og bygger uge {week}…",
+        model_manager.COACH_MODEL,
+    )
     try:
         return shadow_week_thinking.handle(message)
     except Exception as exc:
@@ -127,6 +141,7 @@ def wants_catalog(message: str) -> bool:
 
 
 def catalog_answer(message: str) -> str:
+    stage("Undersøger den installerede Garmin-klients read-only værktøjer…")
     try:
         api = catalog.login()
         rows = catalog.build_catalog(api)
@@ -150,6 +165,7 @@ def catalog_answer(message: str) -> str:
 
 
 def workout_mutation(message: str, operation: str) -> str:
+    stage("Garmin-værktøjet ændrer test-workout og verificerer read-back…")
     if operation == "delete_test_workout":
         try:
             return test_workout_calendar.describe(test_workout_calendar.delete_completely())
@@ -162,6 +178,7 @@ def workout_mutation(message: str, operation: str) -> str:
     except Exception as first_error:
         if operation == "create_test_workout":
             try:
+                stage("Første Garmin-format afveg; prøver godkendt master-struktur…")
                 return workout_selfheal.recover(message)
             except Exception as second_error:
                 return (
@@ -173,6 +190,7 @@ def workout_mutation(message: str, operation: str) -> str:
 
 
 def apply_direct_update(parsed_intent: dict) -> str:
+    stage("Garmin-værktøjet opdaterer workoutet in-place og læser det tilbage…")
     try:
         result = garmin_workout_workspace.update_test(parsed_intent)
         return garmin_workout_workspace.describe(result)
@@ -203,6 +221,7 @@ def handle_action_bundle(message: str) -> str | None:
 
     calendar_op = bundle.get("calendar_operation")
     if calendar_op:
+        stage("Garmin-værktøjet ændrer kalenderen og verificerer den direkte i Garmin…")
         intent = dict(bundle.get("parsed_intent") or {})
         intent["operation"] = calendar_op
         intent["target_date"] = bundle.get("target_date")
@@ -214,6 +233,10 @@ def handle_action_bundle(message: str) -> str | None:
 
 
 def deep_answer(message: str) -> str:
+    stage(
+        "8B ekspert sammenholder flere ugers træning, helbredstrend, mål og empiri…",
+        model_manager.COACH_MODEL,
+    )
     try:
         return expert_chat.answer(message)
     except Exception as exc:
@@ -221,6 +244,7 @@ def deep_answer(message: str) -> str:
 
 
 def normal_answer(message: str) -> str:
+    stage("4B samtalecoach formulerer et kort svar ud fra de validerede data…", model_manager.CHAT_MODEL)
     try:
         return conversation_chat.answer(message)
     except Exception as exc:
@@ -236,6 +260,7 @@ def answer(message: str) -> str:
 
     automation = auto_calendar_control.handle(message)
     if automation is not None:
+        stage("Opdaterer coachens automatiske Garmin-indstilling…")
         return automation
 
     routed = handle_action_bundle(message)
@@ -247,6 +272,7 @@ def answer(message: str) -> str:
     if operation in {"create_test_workout", "update_test_workout", "delete_test_workout"}:
         return workout_mutation(message, operation)
     if operation in {"schedule_test_workout", "move_test_workout", "unschedule_test_workout"}:
+        stage("Garmin-værktøjet opdaterer kalenderen og kontrollerer resultatet…")
         try:
             return test_workout_calendar.handle_intent(intent)
         except Exception as exc:
@@ -255,6 +281,7 @@ def answer(message: str) -> str:
     if wants_catalog(message):
         return catalog_answer(message)
 
+    stage("Kontrollerer om spørgsmålet kan besvares direkte fra Garmin-data…")
     direct = fast.direct_tool_answer(message)
     if direct is not None:
         return direct
