@@ -1,9 +1,10 @@
 """Tool-aware local coach chat entrypoint.
 
-Extends coach_chat_fast with Garmin discovery and a tightly scoped calendar tool for
-the active CoachTest workout. The athlete speaks ordinary Danish. Read-only discovery
-never invokes unknown endpoints; explicit calendar requests can only schedule/move/
-unschedule the one active test workout and are verified by Garmin read-back.
+The athlete speaks ordinary Danish. The agent owns four constrained tool families:
+Garmin discovery, challenge/workout tools from coach_chat_fast, explicit CoachTest
+workout mutations, and explicit CoachTest calendar placement. Workout create/update
+gets one automatic self-heal retry using the athlete's approved Garmin master shape
+before an error is surfaced.
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ import threading
 
 import coach_chat_fast as fast
 import garmin_method_catalog as catalog
+import garmin_workout_workspace
 import test_workout_calendar
 import training_intent
+import workout_selfheal
 
 
 def wants_catalog(message: str) -> bool:
@@ -53,13 +56,36 @@ def catalog_answer(message: str) -> str:
     return "\n".join(lines)
 
 
+def workout_mutation(message: str, operation: str) -> str:
+    try:
+        result = garmin_workout_workspace.handle(message)
+        return result or "Workout-handlingen blev gennemført."
+    except Exception as first_error:
+        if operation in {"create_test_workout", "update_test_workout"}:
+            try:
+                return workout_selfheal.recover(message)
+            except Exception as second_error:
+                return (
+                    "Jeg prøvede først standardformatet og derefter automatisk Garmin-master-formatet. "
+                    f"Begge blev afvist, så jeg stoppede uden at fortsætte blindt. Første fejl: {first_error}. "
+                    f"Self-heal: {second_error}"
+                )
+        return f"Jeg forstod Garmin-handlingen, men gennemførte den ikke: {first_error}"
+
+
 def answer(message: str) -> str:
     intent = training_intent.deterministic(message)
-    if intent.get("operation") in {"schedule_test_workout", "move_test_workout", "unschedule_test_workout"}:
+    operation = str(intent.get("operation") or "")
+
+    if operation in {"create_test_workout", "update_test_workout", "delete_test_workout"}:
+        return workout_mutation(message, operation)
+
+    if operation in {"schedule_test_workout", "move_test_workout", "unschedule_test_workout"}:
         try:
             return test_workout_calendar.handle_intent(intent)
         except Exception as exc:
             return f"Jeg forstod kalenderhandlingen, men gennemførte den ikke: {exc}"
+
     if wants_catalog(message):
         return catalog_answer(message)
     return fast.fast_answer(message)
