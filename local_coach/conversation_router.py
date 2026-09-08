@@ -16,16 +16,15 @@ MOVE_RE = re.compile(r"\b(?:flyt|flytte|flyttes|flyttet|ryk|rykke|rykkes|rykket|
 ADD_RE = re.compile(r"\b(?:læg|laeg|lægge|laegge|lægges|laegges|sæt|saet|sætte|saette|sættes|saettes|put|putte|puttes|placer|placér|placere|placeres|planlæg|planlaeg|planlægge|planlaegge|schedule)\b", re.I)
 REMOVE_CAL_RE = re.compile(r"(?:fjern|fjerne|fjernes|tag|tage|slet|slette)\b.*\bkalender", re.I)
 UPDATE_RE = re.compile(r"\b(?:juster|justere|justeres|justér|ændr|ændre|ændres|ret|rette|rettes|forkort|forkorte|forkortes|forlæng|forlænge|forlænges|kortere|længere|skift|skifte|skiftes)\b", re.I)
-DELETE_WORKOUT_RE = re.compile(r"\b(?:slet|slette|fjern|fjerne)\b.*\b(?:test(?:[- ]?(?:løb|pas|workout))|coach[- ]?test)", re.I)
-TEST_REF_RE = re.compile(r"\b(?:den|det|test(?:[- ]?(?:løb|pas|workout))|coach[- ]?test|løbet|passet|workoutet)\b", re.I)
+TEST_NOUN = r"(?:løb(?:et)?|pas(?:set)?|workout(?:et)?)"
+TEST_REF_RE = re.compile(rf"\b(?:den|det|test(?:[- ]?{TEST_NOUN})?|coach[- ]?test(?:[- ]?{TEST_NOUN})?|løbet|passet|workoutet)\b", re.I)
+DELETE_WORKOUT_RE = re.compile(rf"\b(?:slet|slette|fjern|fjerne)\b.*\b(?:test(?:[- ]?{TEST_NOUN})?|coach[- ]?test(?:[- ]?{TEST_NOUN})?)\b", re.I)
 CALENDAR_RE = re.compile(r"\bkalender(?:en)?\b", re.I)
 
 
 def destination_date(text: str) -> str | None:
     """Prefer the destination after 'til' for move phrases with two dates/days."""
     lower = text.casefold()
-    # Examples: 'fra torsdag til fredag', 'flyt den til 11/9',
-    # 'put den i kalenderen til på torsdag'. Use the last ' til ' clause.
     parts = re.split(r"\btil\b", lower)
     if len(parts) > 1:
         suffix = parts[-1].strip()
