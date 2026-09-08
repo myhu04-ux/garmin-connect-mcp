@@ -88,7 +88,9 @@ def deterministic(message: str) -> dict[str, Any]:
 
     sport = "strength" if objective == "strength" else ("running" if operation != "training_question" or any(k in text for k in ("løb", "run", "vo2", "trail", "tempo")) else "unknown")
 
-    duration = _num(r"(?:i|på|ca\.?|cirka)?\s*(\d+(?:[\.,]\d+)?)\s*min", text)
+    duration = _num(r"(?:i|på|samlet|maks|max|ca\.?|cirka)\s*(\d+(?:[\.,]\d+)?)\s*min", text)
+    if duration is None:
+        duration = _num(r"(\d+(?:[\.,]\d+)?)\s*min(?:utters?)?\s*(?:pas|træning|løb|workout)", text)
     distance = _num(r"(\d+(?:[\.,]\d+)?)\s*km", text)
     repetitions = _num(r"(\d+)\s*[x×]\s*\d", text)
     work = _num(r"\d+\s*[x×]\s*(\d+(?:[\.,]\d+)?)\s*min", text)
