@@ -61,10 +61,12 @@ function Ensure-Templates([switch]$Force) {
 
 function Build-CoachOutput([switch]$ForcePlan) {
     Run-CoachScript 'coach_brief_v2.py' -Required
+    # The rolling adaptive planner uses hidden Qwen3 thinking; only its final JSON is
+    # persisted and it still passes through deterministic validation afterwards.
     if ($ForcePlan) {
-        Run-CoachScript 'adaptive_preview_expert.py' @('--force') -Required
+        Run-CoachScript 'adaptive_preview_thinking.py' @('--force') -Required
     } else {
-        Run-CoachScript 'adaptive_preview_expert.py' -Required
+        Run-CoachScript 'adaptive_preview_thinking.py' -Required
     }
     Run-CoachScript 'preview_integrity.py' -Required
     Run-CoachScript 'coach_voice_fast.py' -Required
@@ -98,8 +100,6 @@ function Run-Status([switch]$RefreshTemplates, [switch]$ForcePlan) {
 }
 
 function Run-Auto {
-    # Scheduled runs explicitly request a fresh expert decision. The guarded writer
-    # still refuses changes until the write-back test and explicit enable are passed.
     Run-Status -ForcePlan
     Run-CoachScript 'calendar_writer_safe.py' @('--apply') -Required
     Run-CoachScript 'calendar_probe.py' -Required
