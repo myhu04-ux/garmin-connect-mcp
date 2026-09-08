@@ -22,7 +22,7 @@ import expert_chat
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import model_manager
-import shadow_week_expert
+import shadow_week_thinking
 import test_workout_calendar
 import training_intent
 import workout_selfheal
@@ -87,7 +87,7 @@ def wants_shadow_week(message: str) -> bool:
 
 def shadow_week_answer(message: str) -> str:
     try:
-        return shadow_week_expert.handle(message)
+        return shadow_week_thinking.handle(message)
     except Exception as exc:
         text = str(exc)
         if "Ekspertmodellen" in text or "installeres lokalt" in text or "qwen3:8b" in text:
