@@ -101,13 +101,14 @@ def catalog_answer(message: str) -> str:
 
 
 def workout_mutation(message: str, operation: str) -> str:
+    # Full delete is a Garmin-state reconciliation, not a language-model task:
+    # remove every live calendar instance for the active workout, then delete the
+    # workout template itself and verify both operations.
     if operation == "delete_test_workout":
         try:
-            state = test_workout_calendar.load(test_workout_calendar.STATE, {})
-            if isinstance(state, dict) and (state.get("scheduled_workout_id") or state.get("scheduled_date")):
-                test_workout_calendar.unschedule()
+            return test_workout_calendar.describe(test_workout_calendar.delete_completely())
         except Exception as exc:
-            return f"Jeg sletter ikke workoutet, fordi kalenderplaceringen først skulle fjernes sikkert: {exc}"
+            return f"Jeg forstod, at træningen skulle slettes helt, men Garmin kunne ikke gennemføre det sikkert: {exc}"
 
     try:
         result = garmin_workout_workspace.handle(message)
