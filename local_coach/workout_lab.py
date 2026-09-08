@@ -5,11 +5,12 @@ sanitized personal copy in memory, validate its structure and save a readable
 semantic signature locally.
 
 Optional --upload-test uploads only to the Garmin workout library, reads the workout
-back, compares its semantic structure, then deletes the temporary test again unless
+back, compares its execution semantics, then deletes the temporary test again unless
 --keep-uploaded is explicitly supplied. It never schedules anything in the calendar.
 
-The purpose is to prove workout formatting independently before adaptive calendar
-write-back is enabled.
+Garmin may rewrite harmless DTO metadata/default values on save. Verification therefore
+compares an execution contract (sport, ordered step types, duration/distance,
+repetitions and meaningful targets), not byte-for-byte JSON.
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ def step_signature(step: dict[str, Any]) -> dict[str, Any]:
         "target_type": nested_key(step, "targetType", "workoutTargetTypeKey", "key", "name") or step.get("workoutTargetTypeKey"),
         "target_low": step.get("targetValueOne"),
         "target_high": step.get("targetValueTwo"),
+        "zone_number": step.get("zoneNumber"),
         "iterations": step.get("numberOfIterations"),
         "category": step.get("category"),
         "exercise_name": step.get("exerciseName"),
@@ -84,6 +86,124 @@ def semantic_signature(raw: dict[str, Any]) -> dict[str, Any]:
         "segment_count": len(segments),
         "steps": steps,
     }
+
+
+def _key(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip().casefold().replace("_", ".").replace("-", ".")
+    while ".." in text:
+        text = text.replace("..", ".")
+    aliases = {
+        "none": "no.target",
+        "no.target": "no.target",
+        "notarget": "no.target",
+        "heart.rate.zone": "heart.rate.zone",
+        "heartrate.zone": "heart.rate.zone",
+        "pace.zone": "pace.zone",
+        "speed.zone": "speed.zone",
+        "lap.button": "lap.button",
+    }
+    return aliases.get(text, text)
+
+
+def _num(value: Any) -> int | float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if abs(number) < 1e-9:
+        return 0
+    rounded = round(number, 4)
+    return int(rounded) if float(rounded).is_integer() else rounded
+
+
+def normalized_signature(sig: dict[str, Any]) -> dict[str, Any]:
+    """Return Garmin-save-stable execution semantics.
+
+    Garmin routinely injects IDs, DTO defaults, target placeholders and numeric type
+    changes when saving a workout. Those are not execution changes. We intentionally
+    ignore stepOrder/DTO/description and non-applicable repeat-group defaults, while
+    preserving ordered step sequence, timing/distance, repetitions and meaningful
+    targets/exercise fields.
+    """
+    sport_key = _key(sig.get("sport_type_key"))
+    out: dict[str, Any] = {
+        "sport": sport_key or _num(sig.get("sport_type_id")),
+        "segment_count": int(sig.get("segment_count") or 0),
+        "steps": [],
+    }
+
+    for source in sig.get("steps", []) if isinstance(sig.get("steps"), list) else []:
+        if not isinstance(source, dict):
+            continue
+        step_type = _key(source.get("step_type")) or "unknown"
+        row: dict[str, Any] = {"step_type": step_type}
+
+        if step_type == "repeat":
+            row["iterations"] = int(_num(source.get("iterations")) or _num(source.get("end_value")) or 0)
+            out["steps"].append(row)
+            continue
+
+        end_condition = _key(source.get("end_condition"))
+        if end_condition:
+            row["end_condition"] = end_condition
+        end_value = _num(source.get("end_value"))
+        if end_value is not None:
+            row["end_value"] = end_value
+
+        target_type = _key(source.get("target_type")) or "no.target"
+        row["target_type"] = target_type
+        if target_type != "no.target":
+            low = _num(source.get("target_low"))
+            high = _num(source.get("target_high"))
+            zone = _num(source.get("zone_number"))
+            if low is not None:
+                row["target_low"] = low
+            if high is not None:
+                row["target_high"] = high
+            if zone is not None:
+                row["zone_number"] = zone
+
+        # Strength semantics are meaningful when present; Garmin may omit empty values.
+        category = _key(source.get("category"))
+        exercise_name = _key(source.get("exercise_name"))
+        weight = _num(source.get("weight_value"))
+        if category:
+            row["category"] = category
+        if exercise_name:
+            row["exercise_name"] = exercise_name
+        if weight not in (None, 0):
+            row["weight_value"] = weight
+
+        out["steps"].append(row)
+    return out
+
+
+def signature_differences(expected: dict[str, Any], actual: dict[str, Any], limit: int = 8) -> list[str]:
+    """Human-readable differences between two normalized execution contracts."""
+    diffs: list[str] = []
+    if expected.get("sport") != actual.get("sport"):
+        diffs.append(f"sport: forventet {expected.get('sport')}, Garmin {actual.get('sport')}")
+    if expected.get("segment_count") != actual.get("segment_count"):
+        diffs.append(f"segmenter: forventet {expected.get('segment_count')}, Garmin {actual.get('segment_count')}")
+
+    exp_steps = expected.get("steps") or []
+    act_steps = actual.get("steps") or []
+    if len(exp_steps) != len(act_steps):
+        diffs.append(f"antal udførelsestrin: forventet {len(exp_steps)}, Garmin {len(act_steps)}")
+
+    for index, (exp, act) in enumerate(zip(exp_steps, act_steps), start=1):
+        if exp == act:
+            continue
+        keys = sorted(set(exp) | set(act))
+        changed = [f"{key} {exp.get(key)!r}->{act.get(key)!r}" for key in keys if exp.get(key) != act.get(key)]
+        diffs.append(f"trin {index}: " + ", ".join(changed[:5]))
+        if len(diffs) >= limit:
+            break
+    return diffs[:limit]
 
 
 def validation_errors(raw: dict[str, Any]) -> list[str]:
@@ -115,8 +235,6 @@ def validation_errors(raw: dict[str, Any]) -> list[str]:
                 errors.append(f"Et trin i segment {seg_index} mangler stepOrder.")
             else:
                 key = (seg_index, order)
-                # Nested repeat children can legitimately have their own order space,
-                # so duplicate warning is informational only if exact DTO differs.
                 if key in seen_orders and step.get("type") != "RepeatGroupDTO":
                     pass
                 seen_orders.add(key)
@@ -146,7 +264,6 @@ def find_master(query: str | None) -> dict[str, Any] | None:
     if not masters:
         return None
     if not query:
-        # Prefer a simple running master for the first lab test.
         preferred = [m for m in masters if m.get("family") in {"easy_run", "trail_easy"}]
         return (preferred or masters)[0]
     q = str(query).strip().casefold()
@@ -155,15 +272,6 @@ def find_master(query: str | None) -> dict[str, Any] | None:
         return exact[0]
     contains = [m for m in masters if q in str(m.get("title") or "").casefold() or q == str(m.get("family") or "").casefold()]
     return contains[0] if contains else None
-
-
-def normalized_signature(sig: dict[str, Any]) -> dict[str, Any]:
-    """Remove descriptive fields Garmin may rewrite while keeping execution semantics."""
-    data = copy.deepcopy(sig)
-    for step in data.get("steps", []):
-        if isinstance(step, dict):
-            step.pop("description", None)
-    return data
 
 
 def login() -> Garmin:
@@ -208,11 +316,7 @@ def main() -> int:
 
     result: dict[str, Any] = {
         "generated_at": dt.datetime.now().astimezone().isoformat(),
-        "master": {
-            "family": master.get("family"),
-            "workout_id": master.get("workout_id"),
-            "title": master.get("title"),
-        },
+        "master": {"family": master.get("family"), "workout_id": master.get("workout_id"), "title": master.get("title")},
         "candidate_name": args.name,
         "candidate_validation_ok": not errors,
         "validation_errors": errors,
@@ -224,13 +328,8 @@ def main() -> int:
     print("=== GARMIN WORKOUT LAB ===")
     print(f"Master: {master.get('title')} | family={master.get('family')} | workout={master.get('workout_id')}")
     print(f"Testnavn: {args.name}")
-    print(f"Sport: {expected_sig.get('sport_type_key')} | segmenter={expected_sig.get('segment_count')} | trin={len(expected_sig.get('steps') or [])}")
-    for step in expected_sig.get("steps", []):
-        print(
-            f"- trin {step.get('order')}: {step.get('step_type')} | {step.get('end_condition')}={step.get('end_value')} | "
-            f"target={step.get('target_type')} {step.get('target_low') or ''}-{step.get('target_high') or ''}" +
-            (f" | {step.get('category')}/{step.get('exercise_name')}" if step.get('category') or step.get('exercise_name') else "")
-        )
+    norm = normalized_signature(expected_sig)
+    print(f"Sport: {norm.get('sport')} | segmenter={norm.get('segment_count')} | trin={len(norm.get('steps') or [])}")
     if errors:
         print("FORMATFEJL:")
         for error in errors:
@@ -247,6 +346,7 @@ def main() -> int:
     api = login()
     uploaded_id = None
     cleanup_ok = None
+    return_code = 0
     try:
         upload_result = api.upload_workout(candidate)
         if not isinstance(upload_result, dict) or not upload_result.get("workoutId"):
@@ -257,23 +357,33 @@ def main() -> int:
 
         readback = api.get_workout_by_id(uploaded_id)
         actual_sig = semantic_signature(readback if isinstance(readback, dict) else {})
-        format_match = normalized_signature(expected_sig) == normalized_signature(actual_sig)
+        expected_norm = normalized_signature(expected_sig)
+        actual_norm = normalized_signature(actual_sig)
+        differences = signature_differences(expected_norm, actual_norm)
+        format_match = not differences
         name_match = isinstance(readback, dict) and str(readback.get("workoutName") or "") == str(args.name)
-        result["readback_name"] = readback.get("workoutName") if isinstance(readback, dict) else None
-        result["actual_signature"] = actual_sig
-        result["semantic_format_match"] = format_match
-        result["name_match"] = name_match
-        result["readback_ok"] = bool(format_match and name_match)
+        result.update({
+            "readback_name": readback.get("workoutName") if isinstance(readback, dict) else None,
+            "actual_signature": actual_sig,
+            "expected_execution": expected_norm,
+            "actual_execution": actual_norm,
+            "differences": differences,
+            "semantic_format_match": format_match,
+            "name_match": name_match,
+            "readback_ok": bool(format_match and name_match),
+        })
 
         print(f"UPLOAD: Garmin workout-id {uploaded_id}")
         print(f"READ-BACK navn: {'OK' if name_match else 'FEJL'}")
-        print(f"READ-BACK struktur: {'OK' if format_match else 'FEJL'}")
+        print(f"READ-BACK udførelse: {'OK' if format_match else 'FEJL'}")
+        if differences:
+            for diff in differences:
+                print(f"- {diff}")
         if not result["readback_ok"]:
             print("Testen bestod ikke. Workout-formatet må ikke bruges til automatisk kalender-writeback endnu.")
             return_code = 5
         else:
             print("FORMATTEST BESTÅET: Garmin læste workoutet tilbage med samme udførelsesstruktur.")
-            return_code = 0
     finally:
         if uploaded_id and not args.keep_uploaded:
             try:
