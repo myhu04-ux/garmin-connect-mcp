@@ -58,6 +58,14 @@ def catalog_answer(message: str) -> str:
 
 
 def workout_mutation(message: str, operation: str) -> str:
+    if operation == "delete_test_workout":
+        try:
+            state = test_workout_calendar.load(test_workout_calendar.STATE, {})
+            if isinstance(state, dict) and (state.get("scheduled_workout_id") or state.get("scheduled_date")):
+                test_workout_calendar.unschedule()
+        except Exception as exc:
+            return f"Jeg sletter ikke workoutet, fordi jeg først skulle fjerne det sikkert fra kalenderen, og det fejlede: {exc}"
+
     try:
         result = garmin_workout_workspace.handle(message)
         return result or "Workout-handlingen blev gennemført."
