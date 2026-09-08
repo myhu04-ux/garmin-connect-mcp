@@ -40,7 +40,6 @@ def parse_week(message: str, today: dt.date | None = None) -> tuple[int, int]:
         raise RuntimeError("Ugenummeret skal være mellem 1 og 53.")
     ym = re.search(r"\b(20\d{2})\b", message)
     year = int(ym.group(1)) if ym else today.year
-    # Validate ISO combination.
     dt.date.fromisocalendar(year, week, 1)
     return year, week
 
@@ -58,7 +57,7 @@ def load_inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[
     return state, calendar, library, knowledge, profile
 
 
-def build_week_context(year: int, week: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_week_context(year: int, week: int, user_request: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     state, calendar, library, knowledge, profile = load_inputs()
     dates = iso_week_dates(year, week)
     context = base.build_context(state, calendar, library, knowledge, profile)
@@ -68,8 +67,10 @@ def build_week_context(year: int, week: int) -> tuple[dict[str, Any], dict[str, 
     context["planning_iso_year"] = year
     context["planning_iso_week"] = week
     context["planning_window"] = {"from": dates[0], "to": dates[-1]}
+    context["shadow_user_request"] = str(user_request or "")[:1200]
     context.setdefault("rules", {})["shadow_mode_no_garmin_write"] = True
     context["rules"]["plan_the_whole_allowed_week_not_a_rolling_window"] = True
+    context["rules"]["explicit_user_request_is_a_constraint_if_safe"] = True
     return context, library
 
 
@@ -90,18 +91,19 @@ BRUG DENNE PRIORITET:
 KRAV:
 - Planlæg kun på datoerne i allowed_dates. De udgør hele uge {week}.
 - Tænk i ugens samlede belastning, ikke syv uafhængige pas.
+- Behandl shadow_user_request som brugerens aktuelle ønske/ramme, hvis det er træningsmæssigt forsvarligt.
 - Forklar formålet med hvert træningspas fysiologisk og i relation til hovedmålet.
 - Brug hvile/restitution når det er den bedste løsning; der skal ikke nødvendigvis være træning alle syv dage.
 - Brug kun godkendte workout-families. Python binder senere til konkrete Garmin-workouts.
 - Styrke må kun bruge strength_master.
 - Undgå to hårde dage i træk og aggressiv catch-up.
 - Hvis personlige data er utilstrækkelige, vælg konservativt og sig det i week_assessment.
-- Brug evidence_tags når et konkret empirical principle faktisk understøtter valget.
+- Brug evidence_tags når et konkret empiriprincip faktisk understøtter valget.
 - Alt brugervendt tekst på dansk.
 
 Returner KUN valid JSON:
 {{
-  "week_assessment": "samlet trænerfaglig vurdering af uge 38 ud fra data og empiri",
+  "week_assessment": "samlet trænerfaglig vurdering af uge {week} ud fra data og empiri",
   "actions": [
     {{
       "action": "KEEP|MOVE|ADJUST|ADD|REMOVE",
@@ -147,8 +149,8 @@ def call_model(context: dict[str, Any]) -> dict[str, Any]:
     return json.loads(response.json().get("message", {}).get("content", ""))
 
 
-def generate(year: int, week: int) -> dict[str, Any]:
-    context, library = build_week_context(year, week)
+def generate(year: int, week: int, user_request: str | None = None) -> dict[str, Any]:
+    context, library = build_week_context(year, week, user_request)
     try:
         raw = call_model(context)
         source = "ollama"
@@ -162,6 +164,7 @@ def generate(year: int, week: int) -> dict[str, Any]:
     plan["planning_iso_year"] = year
     plan["planning_iso_week"] = week
     plan["planning_window"] = context["planning_window"]
+    plan["shadow_user_request"] = context.get("shadow_user_request")
     out = DATA / f"shadow_week_{year}_W{week:02d}.json"
     txt = DATA / f"shadow_week_{year}_W{week:02d}.txt"
     out.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -203,7 +206,7 @@ def render_chat(plan: dict[str, Any]) -> str:
 
 def handle(message: str) -> str:
     year, week = parse_week(message)
-    plan = generate(year, week)
+    plan = generate(year, week, message)
     return render_chat(plan)
 
 
