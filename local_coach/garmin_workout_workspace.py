@@ -2,10 +2,11 @@
 
 One explicitly requested test workout may be created in the Garmin workout library,
 updated in place, inspected and deleted. It is never scheduled automatically. Every
-write is followed by a Garmin read-back and semantic structure verification.
+write is followed by a Garmin read-back and execution-semantics verification.
 
 Natural-language interpretation lives in training_intent.py; this module is the
-constrained Garmin compiler/executor.
+constrained Garmin compiler/executor. Garmin may normalize harmless JSON metadata,
+so verification compares the execution contract rather than raw DTO equality.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import workout_lab
 ROOT = Path(r"C:\GarminCoach")
 DATA = ROOT / "data"
 STATE = DATA / "active_test_workout.json"
+VERIFY_REPORT = DATA / "test_workout_verification.json"
 TOKEN_DIR = os.path.expanduser("~/.garminconnect")
 
 SPORT = {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
@@ -145,8 +147,7 @@ def total_minutes(recipe: dict[str, Any]) -> float:
     work = float(recipe.get("work_min") or 0)
     recovery = float(recipe.get("recovery_min") or 0)
     cool = float(recipe.get("cooldown_min") or 0)
-    # The Garmin repeat group executes both child steps on every iteration,
-    # including recovery after the final work bout before cooldown.
+    # Garmin executes both children on every repeat, including the final recovery.
     return warm + reps * (work + recovery) + cool
 
 
@@ -165,14 +166,12 @@ def adjust_total(recipe: dict[str, Any], relative_minutes: float | None, request
     reps = max(1, int(recipe.get("repetitions") or 1))
 
     if delta < 0:
-        # First trim easy minutes, keeping sensible floors.
         remove = min(-delta, max(0.0, cool - 5.0))
         cool -= remove
         delta += remove
         remove = min(-delta, max(0.0, warm - 8.0))
         warm -= remove
         delta += remove
-        # Then shorten recoveries slightly before reducing the work stimulus.
         if delta < -0.01 and recovery > 1.0:
             per_rep = min(recovery - 1.0, (-delta) / reps)
             recovery -= per_rep
@@ -247,16 +246,36 @@ def build_candidate(intent: dict[str, Any], existing_spec: dict[str, Any] | None
     return candidate, recipe
 
 
-def _verify(readback: Any, candidate: dict[str, Any]) -> tuple[bool, str]:
+def _verify(readback: Any, candidate: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    expected_raw = workout_lab.semantic_signature(candidate)
+    actual_raw = workout_lab.semantic_signature(readback if isinstance(readback, dict) else {})
+    expected = workout_lab.normalized_signature(expected_raw)
+    actual = workout_lab.normalized_signature(actual_raw)
+    differences = workout_lab.signature_differences(expected, actual)
+    name_expected = str(candidate.get("workoutName") or "")
+    name_actual = str(readback.get("workoutName") or "") if isinstance(readback, dict) else ""
+    name_match = bool(name_actual == name_expected)
+
+    report = {
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "name_expected": name_expected,
+        "name_actual": name_actual,
+        "name_match": name_match,
+        "expected_execution": expected,
+        "actual_execution": actual,
+        "differences": differences,
+        "readback_ok": bool(isinstance(readback, dict) and name_match and not differences),
+    }
+    save(VERIFY_REPORT, report)
+
     if not isinstance(readback, dict):
-        return False, "Garmin returnerede ikke workout-data ved read-back."
-    expected = workout_lab.normalized_signature(workout_lab.semantic_signature(candidate))
-    actual = workout_lab.normalized_signature(workout_lab.semantic_signature(readback))
-    if expected != actual:
-        return False, "Garmin read-back havde en anden udførelsesstruktur end kandidaten."
-    if str(readback.get("workoutName") or "") != str(candidate.get("workoutName") or ""):
-        return False, "Garmin read-back havde et andet workout-navn."
-    return True, "OK"
+        return False, "Garmin returnerede ikke workout-data ved read-back.", report
+    if differences:
+        detail = "; ".join(differences[:4])
+        return False, f"Garmin ændrede udførelsesstrukturen ved read-back: {detail}", report
+    if not name_match:
+        return False, f"Garmin read-back havde navnet {name_actual!r}, forventet {name_expected!r}.", report
+    return True, "OK", report
 
 
 def create_or_replace_test(intent: dict[str, Any]) -> dict[str, Any]:
@@ -271,13 +290,19 @@ def create_or_replace_test(intent: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Garmin returnerede ikke workoutId efter upload.")
     wid = result["workoutId"]
     readback = api.get_workout_by_id(wid)
-    ok, detail = _verify(readback, candidate)
+    ok, detail, report = _verify(readback, candidate)
     if not ok:
+        cleanup_error = None
         try:
             api.delete_workout(wid)
-        except Exception:
-            pass
-        raise RuntimeError(detail)
+        except Exception as exc:
+            cleanup_error = str(exc)[:300]
+        if cleanup_error:
+            raise RuntimeError(
+                detail + f" Test-workout id {wid} kunne ikke slettes automatisk og kan ligge tilbage i Garmin: {cleanup_error}"
+            )
+        raise RuntimeError(detail + " Det afviste test-workout blev slettet igen fra Garmin.")
+
     state = {
         "workout_id": wid,
         "name": candidate["workoutName"],
@@ -285,9 +310,10 @@ def create_or_replace_test(intent: dict[str, Any]) -> dict[str, Any]:
         "created_at": dt.datetime.now().astimezone().isoformat(),
         "updated_at": dt.datetime.now().astimezone().isoformat(),
         "readback_ok": True,
+        "verification_report": str(VERIFY_REPORT),
     }
     save(STATE, state)
-    return {"action": "created", **state, "signature": workout_lab.semantic_signature(readback)}
+    return {"action": "created", **state, "signature": report.get("actual_execution")}
 
 
 def update_test(intent: dict[str, Any], force_objective: bool = False) -> dict[str, Any]:
@@ -296,28 +322,51 @@ def update_test(intent: dict[str, Any], force_objective: bool = False) -> dict[s
         if force_objective:
             return create_or_replace_test(intent)
         raise RuntimeError("Der findes ikke et aktivt CoachTest-workout endnu. Bed mig først om at lave et test-løb.")
+
     wid = current["workout_id"]
     old_recipe = current.get("recipe") if isinstance(current.get("recipe"), dict) else None
     candidate, recipe = build_candidate(intent, old_recipe, current.get("name"))
     api = login()
-    existing = api.get_workout_by_id(wid)
+    try:
+        existing = api.get_workout_by_id(wid)
+    except Exception as exc:
+        # State can become stale if the athlete manually deletes the test workout.
+        try:
+            STATE.unlink()
+        except FileNotFoundError:
+            pass
+        if force_objective:
+            return create_or_replace_test(intent)
+        raise RuntimeError(f"Det aktive test-workout findes ikke længere i Garmin: {exc}") from exc
     if not isinstance(existing, dict):
         raise RuntimeError("Det aktive test-workout kunne ikke læses fra Garmin.")
+
     payload = copy.deepcopy(existing)
     for key in ("workoutName", "sportType", "estimatedDurationInSecs", "description", "workoutSegments"):
         payload[key] = copy.deepcopy(candidate[key])
     api.update_workout(wid, payload)
     readback = api.get_workout_by_id(wid)
-    ok, detail = _verify(readback, candidate)
+    ok, detail, report = _verify(readback, candidate)
     if not ok:
-        raise RuntimeError(detail)
+        rollback_ok = False
+        rollback_error = None
+        try:
+            api.update_workout(wid, existing)
+            rollback_ok = True
+        except Exception as exc:
+            rollback_error = str(exc)[:300]
+        if rollback_ok:
+            raise RuntimeError(detail + " Ændringen blev rullet tilbage til den tidligere test-workout.")
+        raise RuntimeError(detail + f" Rollback fejlede, så kontrollér test-workoutet i Garmin manuelt: {rollback_error}")
+
     current.update({
         "recipe": recipe,
         "updated_at": dt.datetime.now().astimezone().isoformat(),
         "readback_ok": True,
+        "verification_report": str(VERIFY_REPORT),
     })
     save(STATE, current)
-    return {"action": "updated", **current, "signature": workout_lab.semantic_signature(readback)}
+    return {"action": "updated", **current, "signature": report.get("actual_execution")}
 
 
 def delete_test() -> dict[str, Any]:
@@ -351,7 +400,7 @@ def describe(result: dict[str, Any]) -> str:
         line += f", {recipe.get('work_min')} min hoveddel"
     line += f" og {recipe.get('cooldown_min')} min nedjog."
     return "\n".join([
-        f"Jeg har {verb} {result.get('name')} direkte i Garmin Træninger og læst det tilbage: struktur OK.",
+        f"Jeg har {verb} {result.get('name')} direkte i Garmin Træninger og læst det tilbage: udførelsen er verificeret.",
         f"Formål: {recipe.get('title')}.",
         line,
         "Det er kun oprettet under Træninger; jeg har ikke lagt det i kalenderen.",
