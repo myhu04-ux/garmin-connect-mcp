@@ -61,6 +61,8 @@ function Invoke-CoachTests([string]$OldSha) {
         'calendar_writer_self_test.py',
         'shadow_week_self_test.py',
         'coach_benchmark_self_test.py',
+        'coach_routing_self_test.py',
+        'core_evidence_self_test.py',
         'planned_workout_compiler_self_test.py',
         'writeback_transaction_self_test.py'
     )
@@ -107,7 +109,7 @@ if ($remoteSha -eq $oldSha) {
 & $git -C $repo pull --ff-only origin $branch
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Git pull fejlede; gammel version er bevaret.' $oldSha }
 $newSha = (& $git -C $repo rev-parse HEAD).Trim()
-Save-Status 'testing' 'Ny version hentet. Opgraderer fastlåste afhængigheder og kører sikkerheds- og coach-benchmark-tests.' $oldSha $newSha
+Save-Status 'testing' 'Ny version hentet. Opgraderer fastlåste afhængigheder og kører den samlede regressionssuite.' $oldSha $newSha
 
 & $python -m pip install --upgrade -e $repo | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Afhængigheder kunne ikke opdateres; rullet tilbage.' $oldSha }
@@ -144,6 +146,6 @@ if (-not $dashboardReady -or -not $chatReady) {
     exit 3
 }
 
-Save-Status 'updated' 'Coachen er opdateret, benchmark-testet og genstartet. Ekspertmodellen klargøres i baggrunden.' $oldSha $newSha
+Save-Status 'updated' 'Coachen er opdateret, benchmark-testet og genstartet. 4B/8B modellerne klargøres i baggrunden.' $oldSha $newSha
 if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:8766/' }
 exit 0
