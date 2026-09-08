@@ -8,6 +8,7 @@ $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
 $chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
+$selfUpdate = Join-Path $repo 'local_coach\self_update.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $intentTest = Join-Path $repo 'local_coach\intent_self_test.py'
 $routerTest = Join-Path $repo 'local_coach\router_self_test.py'
@@ -21,6 +22,7 @@ if (-not (Test-Path $python)) { throw "Mangler Python-miljø: $python" }
 if (-not (Test-Path $coach)) { throw "Mangler coach-motor: $coach" }
 if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
 if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
+if (-not (Test-Path $selfUpdate)) { throw "Mangler selvopdatering: $selfUpdate" }
 if (-not (Test-Path $intentTest)) { throw "Mangler intent-selftest: $intentTest" }
 if (-not (Test-Path $routerTest)) { throw "Mangler router-selftest: $routerTest" }
 if (-not (Test-Path $compatTest)) { throw "Mangler compatibility-selftest: $compatTest" }
@@ -36,7 +38,7 @@ foreach ($file in $pythonFiles) {
     & $python -m py_compile $file.FullName
     if ($LASTEXITCODE -ne 0) { throw "Python-syntaksfejl i $($file.Name). Den gamle UI stoppes ikke." }
 }
-foreach ($psFile in @($coach, $automation)) {
+foreach ($psFile in @($coach, $automation, $selfUpdate)) {
     $tokens = $null
     $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($psFile, [ref]$tokens, [ref]$parseErrors) | Out-Null
@@ -59,7 +61,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Coachens Garmin-kompatibilitetsfallback fejled
 & $python $calendarWriterTest
 if ($LASTEXITCODE -ne 0) { throw 'Coachens kalendertransaktionstest fejlede. Den gamle UI stoppes ikke.' }
 
-Write-Host "`n4/6 Installerer automatisk coach, dashboard og direkte chat..." -ForegroundColor Cyan
+Write-Host "`n4/6 Installerer automatisk coach, dashboard, direkte chat og selvopdatering..." -ForegroundColor Cyan
 try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $automation -Days 'MON,THU,SUN' -Time '22:00' -InstallUiStartup
     if ($LASTEXITCODE -ne 0) { throw 'Scheduler returnerede fejl.' }
@@ -115,6 +117,7 @@ Start-Process 'http://127.0.0.1:8765/'
 Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
-Write-Host 'Coach-chatten kan søge read-only i Garmin, forstå træningsmål og ved eksplicit besked oprette/justere ét test-workout under Garmin Træninger.'
+Write-Host "Fremtidige kodeopdateringer: skriv 'opdater dig selv' til coach-chatten."
+Write-Host 'Coachen tjekker desuden efter kodeopdateringer ved Windows-login.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
 Write-Host 'Automatisk kalender-writeback er fortsat låst; test-workout-chatten kan kun ændre det aktive test-workout og dets egen kalenderplacering.' -ForegroundColor Yellow
