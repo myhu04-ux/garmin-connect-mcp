@@ -7,6 +7,9 @@ used for genuine coaching conversation, never to improvise a known Garmin mutati
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
 import threading
 
 import auto_calendar_control
@@ -18,6 +21,51 @@ import test_workout_calendar
 import training_intent
 import workout_replace_compat
 import workout_selfheal
+
+
+def wants_self_update(message: str) -> bool:
+    text = " ".join(message.casefold().strip().split())
+    phrases = (
+        "opdater dig selv",
+        "opdater programmet",
+        "hent seneste version",
+        "hent den nyeste version",
+        "installer seneste version",
+    )
+    return any(p in text for p in phrases)
+
+
+def start_self_update() -> str:
+    script = Path(__file__).with_name("self_update.ps1")
+    if not script.exists():
+        return "Selvopdateringsscriptet mangler endnu. Kør den seneste installation én gang manuelt."
+    powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not powershell.exists():
+        return f"Jeg kunne ikke finde PowerShell på {powershell}."
+    flags = 0
+    if os.name == "nt":
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-WindowStyle", "Hidden",
+                "-ExecutionPolicy", "Bypass",
+                "-File", str(script),
+            ],
+            cwd=str(script.parent.parent),
+            creationflags=flags,
+            close_fds=True,
+        )
+    except Exception as exc:
+        return f"Jeg kunne ikke starte selvopdateringen: {exc}"
+    return (
+        "Jeg starter selvopdateringen nu. Jeg henter kun fra coachens faste GitHub-branch, "
+        "kører syntaks- og sikkerhedstests og genstarter kun den nye version, hvis de består. "
+        "Chatten kan forsvinde kortvarigt, mens jeg genstarter."
+    )
 
 
 def wants_catalog(message: str) -> bool:
@@ -150,6 +198,9 @@ def handle_action_bundle(message: str) -> str | None:
 
 
 def answer(message: str) -> str:
+    if wants_self_update(message):
+        return start_self_update()
+
     automation = auto_calendar_control.handle(message)
     if automation is not None:
         return automation
