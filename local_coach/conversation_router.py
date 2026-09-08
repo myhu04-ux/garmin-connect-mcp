@@ -1,8 +1,8 @@
 """Deterministic first-line router for conversational Garmin actions.
 
 Known workout/calendar actions must never fall through to the local LLM. The router
-understands common Danish inflections and can expose compound requests such as
-"gør den 10 min kortere og flyt den til fredag".
+understands common Danish inflections and compound requests such as
+"gør den 10 min kortere og flyt den fra torsdag til fredag".
 """
 
 from __future__ import annotations
@@ -16,15 +16,30 @@ MOVE_RE = re.compile(r"\b(?:flyt|flytte|flyttes|flyttet|ryk|rykke|rykkes|rykket|
 ADD_RE = re.compile(r"\b(?:læg|laeg|lægge|laegge|lægges|laegges|sæt|saet|sætte|saette|sættes|saettes|put|putte|puttes|placer|placér|placere|placeres|planlæg|planlaeg|planlægge|planlaegge|schedule)\b", re.I)
 REMOVE_CAL_RE = re.compile(r"(?:fjern|fjerne|fjernes|tag|tage|slet|slette)\b.*\bkalender", re.I)
 UPDATE_RE = re.compile(r"\b(?:juster|justere|justeres|justér|ændr|ændre|ændres|ret|rette|rettes|forkort|forkorte|forkortes|forlæng|forlænge|forlænges|kortere|længere|skift|skifte|skiftes)\b", re.I)
-DELETE_WORKOUT_RE = re.compile(r"\b(?:slet|slette|fjern|fjerne)\b.*\b(?:test(?:løb|pas|workout)|coach[- ]?test)", re.I)
-TEST_REF_RE = re.compile(r"\b(?:den|det|test(?:løb|pas|workout)|coach[- ]?test|løbet|passet|workoutet)\b", re.I)
+DELETE_WORKOUT_RE = re.compile(r"\b(?:slet|slette|fjern|fjerne)\b.*\b(?:test(?:[- ]?(?:løb|pas|workout))|coach[- ]?test)", re.I)
+TEST_REF_RE = re.compile(r"\b(?:den|det|test(?:[- ]?(?:løb|pas|workout))|coach[- ]?test|løbet|passet|workoutet)\b", re.I)
 CALENDAR_RE = re.compile(r"\bkalender(?:en)?\b", re.I)
+
+
+def destination_date(text: str) -> str | None:
+    """Prefer the destination after 'til' for move phrases with two dates/days."""
+    lower = text.casefold()
+    # Examples: 'fra torsdag til fredag', 'flyt den til 11/9',
+    # 'put den i kalenderen til på torsdag'. Use the last ' til ' clause.
+    parts = re.split(r"\btil\b", lower)
+    if len(parts) > 1:
+        suffix = parts[-1].strip()
+        if suffix:
+            parsed = training_intent.parse_target_date(suffix)
+            if parsed:
+                return parsed
+    return training_intent.parse_target_date(lower)
 
 
 def route(message: str) -> dict[str, Any]:
     text = message.strip()
     lower = text.casefold()
-    target_date = training_intent.parse_target_date(lower)
+    target_date = destination_date(lower)
     parsed = training_intent.deterministic(text)
 
     move = bool(MOVE_RE.search(text)) and bool(target_date or CALENDAR_RE.search(text))
@@ -33,7 +48,6 @@ def route(message: str) -> dict[str, Any]:
     update = bool(UPDATE_RE.search(text)) and bool(TEST_REF_RE.search(text))
     delete_workout = bool(DELETE_WORKOUT_RE.search(text)) and not remove_calendar
 
-    # Explicit numeric/structural edit details that Python can apply without asking.
     update_fields = (
         "duration_min", "distance_km", "repetitions", "work_min", "recovery_min",
         "warmup_min", "cooldown_min", "relative_minutes",
@@ -49,7 +63,12 @@ def route(message: str) -> dict[str, Any]:
         calendar_operation = "schedule_test_workout"
 
     actionish = bool(calendar_operation or update or delete_workout)
-    incomplete_calendar = bool((MOVE_RE.search(text) or ADD_RE.search(text)) and CALENDAR_RE.search(text) and not target_date and not remove_calendar)
+    incomplete_calendar = bool(
+        (MOVE_RE.search(text) or ADD_RE.search(text))
+        and CALENDAR_RE.search(text)
+        and not target_date
+        and not remove_calendar
+    )
 
     return {
         "message": text,
