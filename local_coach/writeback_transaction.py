@@ -69,18 +69,20 @@ def resolve(api: Any, action: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     resolved_id, meta = compiler.resolve_for_action(api, action)
     meta = dict(meta or {})
     created = bool(meta.get("created"))
+    mutated_existing = bool(meta.get("updated") or meta.get("renamed"))
 
-    # If the resolver returned an existing id different from the guessed pre-id,
-    # take a conservative post-hoc classification: only explicit created=True may
-    # ever be deleted during rollback.
+    # Only an explicitly created workout may ever be deleted. Only an explicitly
+    # updated/renamed EXISTING workout may ever be rewritten during rollback. This
+    # prevents a plain MOVE that reuses an approved master from touching the master.
     same_existing = pre_id is not None and str(pre_id) == str(resolved_id)
     key = str(resolved_id or "")
     if key:
         _PENDING[key] = {
             "resolved_id": resolved_id,
             "created": created,
+            "mutated_existing": mutated_existing,
             "same_existing": same_existing,
-            "old_workout": pre_raw if same_existing and not created else None,
+            "old_workout": pre_raw if same_existing and mutated_existing and not created else None,
             "generated_cache": generated_snapshot,
             "named_cache": named_snapshot,
             "action": copy.deepcopy(action),
@@ -106,7 +108,7 @@ def rollback(api: Any, resolved_id: Any) -> tuple[bool, str]:
                 api.delete_workout(resolved_id)
             except Exception as exc:
                 errors.append(f"kunne ikke slette nyt workout: {exc}")
-        elif isinstance(pending.get("old_workout"), dict):
+        elif pending.get("mutated_existing") and isinstance(pending.get("old_workout"), dict):
             try:
                 api.update_workout(resolved_id, copy.deepcopy(pending["old_workout"]))
                 check = api.get_workout_by_id(resolved_id)
