@@ -2,14 +2,15 @@
 
 Adds two guards around the core writer:
 1) every read-back covers the full 7-day horizon, including month boundaries;
-2) if the adaptive plan has no ADD/ADJUST/MOVE yet, --test-one may convert exactly
-   one FUTURE KEEP into a same-content named-copy replacement. That tests Garmin
-   clone + schedule + read-back without changing the prescribed training itself.
+2) only during explicit --test-one, if the adaptive plan has no ADD/ADJUST/MOVE,
+   one FUTURE KEEP may be replaced by a same-content named copy. Normal automatic
+   apply never synthesizes changes.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import sys
 from typing import Any
 
 import calendar_writer as base
@@ -44,14 +45,13 @@ def full_window_calendar(api: Any, action: dict[str, Any]) -> dict[str, Any]:
 
 def actionable_with_safe_test_fallback(preview: dict[str, Any], allow_remove: bool) -> list[dict[str, Any]]:
     actions = _ORIGINAL_ACTIONABLE(preview, allow_remove)
-    if actions or allow_remove:
+    if actions or "--test-one" not in sys.argv:
         return actions
 
-    # For --test-one the core writer calls actionable(..., allow_remove=False).
-    # If the coach correctly decided KEEP for everything, synthesize ONE harmless
-    # same-content replacement of a future KEEP. The existing master workout is
-    # cloned under the plan name (e.g. ThyTrailW3D4), scheduled on the same date,
-    # then the old calendar entry is removed only after the new one is scheduled.
+    # Explicit test only: if the coach correctly decided KEEP for everything,
+    # synthesize ONE harmless same-content replacement of a future KEEP. The
+    # existing master is cloned under the plan name, scheduled on the same date,
+    # and the old calendar entry is removed only after the new one is scheduled.
     today = dt.date.today()
     candidates = []
     for action in preview.get("actions", []) if isinstance(preview.get("actions"), list) else []:
