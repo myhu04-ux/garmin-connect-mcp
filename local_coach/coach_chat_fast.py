@@ -1,12 +1,9 @@
 """Fast, tool-aware entrypoint for the direct local Garmin coach chat.
 
-Common factual questions are answered deterministically from validated local data.
-When the athlete asks about Garmin challenges/badges, the chat refreshes those
-read-only Garmin endpoints on demand before answering. Questions about workout
-format can inspect approved real Garmin master workouts and build a local dry-run
-candidate without writing to Garmin. Free-form coaching questions use local Qwen.
-
-This module never writes to Garmin.
+The athlete speaks ordinary Danish. Read-only Garmin questions are answered by tools,
+not guesses. Explicit requests to create/update/delete *the test workout* are routed
+to a single guarded Garmin workout workspace with read-back verification. General
+coaching questions use local Qwen. Calendar write-back remains separate and locked.
 """
 
 from __future__ import annotations
@@ -19,6 +16,8 @@ import requests
 
 import challenge_probe
 import coach_chat_ui as base
+import garmin_workout_workspace
+import training_intent
 import workout_lab
 
 
@@ -53,15 +52,14 @@ def fast_context() -> dict[str, Any]:
             "reason": str(action.get("reason") or "")[:180],
         })
 
-    active = challenges.get("active") if isinstance(challenges, dict) else []
     challenge_rows = []
+    active = challenges.get("active") if isinstance(challenges, dict) else []
     for item in (active or [])[:8]:
-        if not isinstance(item, dict):
-            continue
-        challenge_rows.append(pick(item, (
-            "name", "description", "start_date", "end_date", "days_remaining",
-            "goal", "progress", "remaining", "completion_pct", "unit", "metric", "status", "source",
-        )))
+        if isinstance(item, dict):
+            challenge_rows.append(pick(item, (
+                "name", "description", "start_date", "end_date", "days_remaining",
+                "goal", "progress", "remaining", "completion_pct", "unit", "metric", "status", "source",
+            )))
 
     active_notes = []
     for row in (notes.get("notes") or [])[-8:] if isinstance(notes, dict) else []:
@@ -103,7 +101,6 @@ def format_number(value: Any) -> str:
 
 
 def challenge_answer() -> str:
-    """Fresh Garmin read; no LLM and no guessing."""
     try:
         rc = challenge_probe.main()
         if rc not in (0, None):
@@ -117,16 +114,13 @@ def challenge_answer() -> str:
     methods = payload.get("method_discovery") or [] if isinstance(payload, dict) else []
 
     if not active:
-        tried = ", ".join(
-            str(x.get("method")) for x in methods
-            if isinstance(x, dict) and x.get("available")
-        ) or "de kendte Garmin challenge-kilder"
+        tried = ", ".join(str(x.get("method")) for x in methods if isinstance(x, dict) and x.get("available")) or "de kendte Garmin challenge-kilder"
         tail = ""
         if errors:
-            tail = " Der var også endpoint-fejl: " + "; ".join(str(x.get("source")) for x in errors[:3] if isinstance(x, dict)) + "."
+            tail = " Endpoint-fejl: " + "; ".join(str(x.get("source")) for x in errors[:3] if isinstance(x, dict)) + "."
         return (
             "Jeg har lige søgt direkte i Garmin via " + tried + ", men parseren fandt endnu ingen aktive udfordringer. "
-            "Jeg gætter derfor ikke. Den rå Garmin-struktur er gemt lokalt, så vi kan lære feltstrukturen fra netop din konto." + tail
+            "Jeg gætter ikke; den rå Garmin-struktur er gemt lokalt, så værktøjet kan tilpasses til netop din konto." + tail
         )
 
     lines = ["Jeg har lige læst Garmin direkte. Jeg kan se disse aktive/relevante udfordringer:"]
@@ -143,9 +137,8 @@ def challenge_answer() -> str:
             detail.append(f"{format_number(item['completion_pct'])}%")
         if item.get("days_remaining") is not None:
             detail.append(f"{item['days_remaining']} dage tilbage")
-        suffix = " – " + ", ".join(detail) if detail else ""
-        lines.append(f"• {item.get('name')}{suffix}")
-    lines.append("De bliver kun brugt som sekundære mål; Thy Trail, restitution og sikker progression har højere prioritet.")
+        lines.append(f"• {item.get('name')}" + (" – " + ", ".join(detail) if detail else ""))
+    lines.append("De er sekundære mål; hovedløb, restitution og sikker progression har højere prioritet.")
     return "\n".join(lines)
 
 
@@ -155,9 +148,9 @@ def master_query_from_message(message: str) -> str | None:
         return "strength_master"
     if has_any(lower, ("lang trail", "langtur", "long trail")):
         return "long_trail"
-    if has_any(lower, ("interval", "bakke", "kvalitet")):
+    if has_any(lower, ("interval", "bakke", "kvalitet", "vo2")):
         return "quality_interval"
-    if has_any(lower, ("tempo", "progressiv")):
+    if has_any(lower, ("tempo", "progressiv", "tærskel")):
         return "quality_tempo"
     if has_any(lower, ("back-to-back", "back to back")):
         return "back_to_back"
@@ -177,8 +170,7 @@ def workout_answer(message: str) -> str:
     if not isinstance(raw, dict):
         return "Jeg fandt masteren, men den rå Garmin-struktur mangler, så jeg vil ikke gætte på formatet."
 
-    dry_name = "LAB-DryRun"
-    candidate = workout_lab.sanitized_copy(raw, dry_name)
+    candidate = workout_lab.sanitized_copy(raw, "LAB-DryRun")
     errors = workout_lab.validation_errors(candidate)
     sig = workout_lab.semantic_signature(candidate)
     workout_lab.CANDIDATE.parent.mkdir(parents=True, exist_ok=True)
@@ -197,16 +189,35 @@ def workout_answer(message: str) -> str:
         if step.get("category") or step.get("exercise_name"):
             part += f", {step.get('category') or ''}/{step.get('exercise_name') or ''}"
         lines.append("• " + part)
-    if len(sig.get("steps") or []) > 12:
-        lines.append(f"• … plus {len(sig['steps']) - 12} yderligere trin")
-    if errors:
-        lines.append("Dry-run fandt formatfejl: " + "; ".join(errors[:4]))
-    else:
-        lines.append("Dry-run er strukturelt OK. Intet blev skrevet til Garmin. En rigtig upload-test skal stadig læses tilbage fra Garmin, før formatet godkendes til automatik.")
+    lines.append("Dry-run: " + ("OK; intet blev skrevet til Garmin." if not errors else "formatfejl: " + "; ".join(errors[:4])))
     return "\n".join(lines)
 
 
-def upcoming_answer(context: dict[str, Any]) -> str | None:
+def training_goal_answer(message: str, intent: dict[str, Any]) -> str:
+    recipe = training_intent.training_recipe(intent)
+    context = fast_context()
+    recovery = str((context.get("recovery") or {}).get("state") or "ukendt")
+    event = context.get("event") or {}
+    event_name = event.get("name") or event.get("event_name")
+    reps = int(recipe.get("repetitions") or 1)
+    if reps > 1:
+        structure = f"{reps} × {recipe.get('work_min')} min arbejde med {recipe.get('recovery_min')} min aktiv pause"
+    else:
+        structure = f"ca. {recipe.get('work_min')} min hoveddel"
+    lines = [
+        f"Jeg forstår målet som: {recipe.get('title')}.",
+        f"Det kræver primært: {recipe.get('stimulus')}",
+        f"Et passende udgangspunkt kunne være {recipe.get('warmup_min')} min opvarmning, {structure} og {recipe.get('cooldown_min')} min nedjog.",
+    ]
+    if recovery != "ukendt":
+        lines.append(f"Din aktuelle restitution står som {recovery}; den skal afgøre, hvornår sådan et kvalitetspas passer ind.")
+    if event_name:
+        lines.append(f"Jeg skal samtidig holde det underordnet dit primære mål: {event_name}.")
+    lines.append("Hvis du skriver 'lav et test-løb med det formål', kan jeg oprette ét arbejds-workout under Garmin Træninger. Jeg lægger det ikke i kalenderen uden en særskilt besked om det.")
+    return "\n".join(lines)
+
+
+def upcoming_answer(context: dict[str, Any]) -> str:
     rows = context.get("upcoming") or []
     if not rows:
         return "Jeg kan ikke se nogen validerede kommende pas i den lokale plan endnu."
@@ -229,16 +240,26 @@ def recovery_answer(context: dict[str, Any]) -> str:
         bits.append(f"HRV {latest['hrv']}")
     if latest.get("resting_hr") is not None:
         bits.append(f"hvilepuls {latest['resting_hr']}")
-    measured = ", ".join(bits[:3])
-    return f"Restitutionen er vurderet som {state}." + (f" Seneste nøgledata: {measured}." if measured else "")
+    return f"Restitutionen er vurderet som {state}." + (f" Seneste nøgledata: {', '.join(bits[:3])}." if bits else "")
 
 
 def direct_tool_answer(message: str) -> str | None:
+    # Explicit test-workout mutations are the only Garmin writes available in chat.
+    basic_intent = training_intent.deterministic(message)
+    if basic_intent.get("operation") in {"create_test_workout", "update_test_workout", "delete_test_workout"}:
+        try:
+            return garmin_workout_workspace.handle(message)
+        except Exception as exc:
+            return f"Jeg forstod Garmin-handlingen, men jeg gennemførte den ikke: {exc}"
+
     if has_any(message, ("udfordring", "udfordringer", "challenge", "challenges", "badge", "badges")):
         return challenge_answer()
 
-    if has_any(message, ("workout", "garmin-format", "garmin format", "struktur", "test-løb", "test løb", "tør test", "dry run")):
+    if has_any(message, ("tør test", "dry run", "garmin-format", "garmin format", "workout struktur", "træningsstruktur")):
         return workout_answer(message)
+
+    if basic_intent.get("objective") != "general" and has_any(message, ("forbedre", "øge", "udvikle", "træne", "kræver", "hvordan", "formål", "vo2", "tærskel", "udholdenhed", "trail")):
+        return training_goal_answer(message, basic_intent)
 
     context = fast_context()
     lower = message.casefold()
@@ -255,9 +276,11 @@ def model_answer(message: str) -> str:
     messages = [{
         "role": "system",
         "content": (
-            "Du er en erfaren personlig løbetræner. Svar på naturligt dansk, kort og konkret. "
-            "Brug kun de givne fakta. Forklar kort hvorfor. Primært løbsmål, restitution og sikker "
-            "progression går foran Garmin-udfordringer. Du ændrer ikke Garmin fra chatten."
+            "Du er en erfaren personlig løbetræner. Forstå brugerens ønskede resultat og oversæt det til, "
+            "hvad træningen fysiologisk og praktisk kræver. Svar på naturligt dansk, kort og konkret. "
+            "Brug kun de givne fakta om brugeren. Primært løbsmål, restitution og sikker progression går "
+            "foran sekundære mål. Påstå aldrig at du har ændret Garmin; Garmin-handlinger udføres kun af "
+            "de særskilte værktøjer ved eksplicitte beskeder om test-workout."
         ),
     }]
     messages.extend({"role": x["role"], "content": str(x["content"])[:500]} for x in history)
@@ -271,7 +294,7 @@ def model_answer(message: str) -> str:
         "think": False,
         "keep_alive": "30m",
         "messages": messages,
-        "options": {"temperature": 0.18, "num_predict": 150, "num_ctx": 3072},
+        "options": {"temperature": 0.18, "num_predict": 170, "num_ctx": 3072},
     }
     response = requests.post(base.OLLAMA_URL, json=payload, timeout=50)
     response.raise_for_status()
@@ -281,9 +304,7 @@ def model_answer(message: str) -> str:
 
 def fast_answer(message: str) -> str:
     direct = direct_tool_answer(message)
-    if direct is not None:
-        return direct
-    return model_answer(message)
+    return direct if direct is not None else model_answer(message)
 
 
 def warm_model() -> None:
