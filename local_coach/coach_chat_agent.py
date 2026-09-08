@@ -58,18 +58,12 @@ def catalog_answer(message: str) -> str:
 
 
 def compatibility_update(message: str, parsed_intent: dict | None = None) -> str:
-    """Update the active test workout without assuming update_workout exists."""
-    try:
-        return workout_replace_compat.recover_message(message, parsed_intent)
-    except Exception as compat_error:
-        # The older master-shape self-heal is still useful for creation. For an
-        # update it may itself require update_workout, so preserve both errors.
-        try:
-            return workout_selfheal.recover(message)
-        except Exception as master_error:
-            raise RuntimeError(
-                f"Kompatibilitets-self-heal fejlede: {compat_error}. Garmin-master self-heal: {master_error}"
-            ) from master_error
+    """Update the active test workout without assuming update_workout exists.
+
+    This path is itself the update self-heal. It must not call the older in-place
+    master self-heal, because that can depend on the exact method that is missing.
+    """
+    return workout_replace_compat.recover_message(message, parsed_intent)
 
 
 def workout_mutation(message: str, operation: str) -> str:
