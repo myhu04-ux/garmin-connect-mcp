@@ -60,7 +60,8 @@ function Invoke-CoachTests([string]$OldSha) {
         'router_self_test.py',
         'calendar_writer_self_test.py',
         'shadow_week_self_test.py',
-        'coach_benchmark_self_test.py'
+        'coach_benchmark_self_test.py',
+        'planned_workout_compiler_self_test.py'
     )
     foreach ($name in $tests) {
         $path = Join-Path $coachDir $name
