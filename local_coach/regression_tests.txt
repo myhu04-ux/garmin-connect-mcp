@@ -11,3 +11,4 @@ planned_workout_compiler_self_test.py
 writeback_transaction_self_test.py
 named_workout_self_test.py
 research_intent_self_test.py
+plan_calendar_operator_self_test.py

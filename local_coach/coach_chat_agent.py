@@ -1,8 +1,8 @@
-"""Compatibility entrypoint for the final local Garmin coach agent.
+"""Compatibility entrypoint for the final local Garmin coach.
 
-The implementation is split into coach_chat_agent_core (stable Garmin/model
-routing) and coach_chat_agent_v2 (natural sourced goal/plan research). This
-filename is preserved for existing Windows startup/scheduler configuration.
+V3 adds deterministic operations on real planned Garmin sessions on top of
+sourced goal/plan research and the stable 4B/8B coaching core. The filename
+stays unchanged so existing Windows startup tasks continue to work.
 """
 
 from __future__ import annotations
@@ -10,10 +10,9 @@ from __future__ import annotations
 import threading
 
 import coach_chat_agent_core as core
-import coach_chat_agent_v2 as app
+import coach_chat_agent_v3 as app
 import model_manager
 
-# Compatibility exports used by regression tests and any older local code.
 fast = core.fast
 conversation_chat = core.conversation_chat
 expert_chat = core.expert_chat
