@@ -2,8 +2,9 @@
 
 Common factual questions are answered deterministically from validated local data.
 When the athlete asks about Garmin challenges/badges, the chat refreshes those
-read-only Garmin endpoints on demand before answering. Free-form coaching questions
-still use the local Qwen model, but with a compact context.
+read-only Garmin endpoints on demand before answering. Questions about workout
+format can inspect approved real Garmin master workouts and build a local dry-run
+candidate without writing to Garmin. Free-form coaching questions use local Qwen.
 
 This module never writes to Garmin.
 """
@@ -18,6 +19,7 @@ import requests
 
 import challenge_probe
 import coach_chat_ui as base
+import workout_lab
 
 
 def pick(mapping: Any, keys: tuple[str, ...]) -> dict[str, Any]:
@@ -103,7 +105,9 @@ def format_number(value: Any) -> str:
 def challenge_answer() -> str:
     """Fresh Garmin read; no LLM and no guessing."""
     try:
-        challenge_probe.main()
+        rc = challenge_probe.main()
+        if rc not in (0, None):
+            raise RuntimeError(f"challenge-proben sluttede med kode {rc}")
     except Exception as exc:
         return f"Jeg prøvede at hente udfordringer direkte fra Garmin, men læsningen fejlede: {exc}"
 
@@ -145,6 +149,63 @@ def challenge_answer() -> str:
     return "\n".join(lines)
 
 
+def master_query_from_message(message: str) -> str | None:
+    lower = message.casefold()
+    if has_any(lower, ("styrke", "benpower", "hofte")):
+        return "strength_master"
+    if has_any(lower, ("lang trail", "langtur", "long trail")):
+        return "long_trail"
+    if has_any(lower, ("interval", "bakke", "kvalitet")):
+        return "quality_interval"
+    if has_any(lower, ("tempo", "progressiv")):
+        return "quality_tempo"
+    if has_any(lower, ("back-to-back", "back to back")):
+        return "back_to_back"
+    if has_any(lower, ("trail", "terræn")):
+        return "trail_easy"
+    if has_any(lower, ("let løb", "zone 2", "rolig")):
+        return "easy_run"
+    return None
+
+
+def workout_answer(message: str) -> str:
+    query = master_query_from_message(message)
+    master = workout_lab.find_master(query)
+    if not master:
+        return "Jeg kan ikke finde en passende godkendt Garmin-master endnu. Kør en fuld template-opdatering først."
+    raw = master.get("raw")
+    if not isinstance(raw, dict):
+        return "Jeg fandt masteren, men den rå Garmin-struktur mangler, så jeg vil ikke gætte på formatet."
+
+    dry_name = "LAB-DryRun"
+    candidate = workout_lab.sanitized_copy(raw, dry_name)
+    errors = workout_lab.validation_errors(candidate)
+    sig = workout_lab.semantic_signature(candidate)
+    workout_lab.CANDIDATE.parent.mkdir(parents=True, exist_ok=True)
+    workout_lab.CANDIDATE.write_text(json.dumps(candidate, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    lines = [
+        f"Jeg har læst den rigtige Garmin-master: {master.get('title')} ({master.get('family')}).",
+        f"Format: {sig.get('sport_type_key')}, {sig.get('segment_count')} segment(er), {len(sig.get('steps') or [])} udførelsestrin.",
+    ]
+    for step in (sig.get("steps") or [])[:12]:
+        part = f"trin {step.get('order')}: {step.get('step_type')}"
+        if step.get("end_condition"):
+            part += f", {step.get('end_condition')}={step.get('end_value')}"
+        if step.get("target_type"):
+            part += f", mål={step.get('target_type')}"
+        if step.get("category") or step.get("exercise_name"):
+            part += f", {step.get('category') or ''}/{step.get('exercise_name') or ''}"
+        lines.append("• " + part)
+    if len(sig.get("steps") or []) > 12:
+        lines.append(f"• … plus {len(sig['steps']) - 12} yderligere trin")
+    if errors:
+        lines.append("Dry-run fandt formatfejl: " + "; ".join(errors[:4]))
+    else:
+        lines.append("Dry-run er strukturelt OK. Intet blev skrevet til Garmin. En rigtig upload-test skal stadig læses tilbage fra Garmin, før formatet godkendes til automatik.")
+    return "\n".join(lines)
+
+
 def upcoming_answer(context: dict[str, Any]) -> str | None:
     rows = context.get("upcoming") or []
     if not rows:
@@ -175,6 +236,9 @@ def recovery_answer(context: dict[str, Any]) -> str:
 def direct_tool_answer(message: str) -> str | None:
     if has_any(message, ("udfordring", "udfordringer", "challenge", "challenges", "badge", "badges")):
         return challenge_answer()
+
+    if has_any(message, ("workout", "garmin-format", "garmin format", "struktur", "test-løb", "test løb", "tør test", "dry run")):
+        return workout_answer(message)
 
     context = fast_context()
     lower = message.casefold()
