@@ -45,13 +45,15 @@ if ($InstallUiStartup) {
     $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
     $escapedPython = $uiPython.Replace('"','""')
     $escapedUi = $ui.Replace('"','""')
-    $escapedChat = $chat.Replace('"','""')
-    $chatLine = if (Test-Path $chat) { "`nshell.Run `"`"`"$escapedPython`"`" `"`"$escapedChat`"`"`", 0, False" } else { '' }
-    $vbs = @"
-Set shell = CreateObject("WScript.Shell")
-shell.Run """$escapedPython"" ""$escapedUi"" --no-browser", 0, False$chatLine
-"@
-    Set-Content -Path $uiLauncher -Value $vbs -Encoding ASCII
+    $vbsLines = @(
+        'Set shell = CreateObject("WScript.Shell")',
+        ('shell.Run """{0}"" ""{1}"" --no-browser", 0, False' -f $escapedPython, $escapedUi)
+    )
+    if (Test-Path $chat) {
+        $escapedChat = $chat.Replace('"','""')
+        $vbsLines += ('shell.Run """{0}"" ""{1}""", 0, False' -f $escapedPython, $escapedChat)
+    }
+    Set-Content -Path $uiLauncher -Value ($vbsLines -join "`r`n") -Encoding ASCII
 
     $url = @"
 [InternetShortcut]
