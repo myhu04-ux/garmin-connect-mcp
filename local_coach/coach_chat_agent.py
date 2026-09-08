@@ -1,8 +1,8 @@
 """Tool-aware local coach chat entrypoint.
 
-The athlete speaks ordinary Danish. Known Garmin actions are routed deterministically
-before the LLM. Garmin mutations use the native APIs required by garminconnect 0.3.12;
-legacy replacement fallbacks are deliberately not used.
+Ordinary Danish is routed to deterministic Garmin tools first. Exact-week planning
+uses a larger local expert model and rich multi-week Garmin/health context; short chat
+uses the small fast model. Garmin writes never depend on free-form LLM interpretation.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import coach_chat_fast as fast
 import conversation_router
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
+import model_manager
 import shadow_week
 import test_workout_calendar
 import training_intent
@@ -70,29 +71,27 @@ def start_self_update() -> str:
 
 
 def wants_shadow_week(message: str) -> bool:
-    """Route an exact ISO-week planning request to the shadow planner, never Garmin writes."""
+    """Catch natural weekly coaching questions before they ever reach the 1.7B chat model."""
     text = " ".join(message.casefold().strip().split())
     if not re.search(r"\buge\s*\d{1,2}\b", text):
         return False
-    phrases = (
-        "shadow",
-        "skyggeplan",
-        "træningsplan for uge",
-        "traeningsplan for uge",
-        "plan for uge",
-        "lav uge",
-        "planlæg uge",
-        "planlaeg uge",
-        "generer uge",
+    planning_words = (
+        "shadow", "skyggeplan", "plan", "planlæg", "planlaeg", "generer", "træning", "traening",
+        "træne", "traene", "hvordan skal", "se ud", "helbred", "restitution", "baseret på", "baseret paa",
+        "sidste uger", "seneste uger", "empiri", "evidens",
     )
-    return any(p in text for p in phrases)
+    return any(word in text for word in planning_words)
 
 
 def shadow_week_answer(message: str) -> str:
     try:
         return shadow_week.handle(message)
     except Exception as exc:
-        return f"Jeg kunne ikke generere shadow-ugen sikkert: {exc}"
+        text = str(exc)
+        # Model installation/status is a normal transient state, not a fake coaching answer.
+        if "coach-model" in text or "installeres lokalt" in text or "qwen3:4b" in text:
+            return text
+        return f"Jeg kunne ikke generere ugeplanen sikkert: {text}"
 
 
 def wants_catalog(message: str) -> bool:
@@ -129,9 +128,6 @@ def catalog_answer(message: str) -> str:
 
 
 def workout_mutation(message: str, operation: str) -> str:
-    # Full delete is a Garmin-state reconciliation, not a language-model task:
-    # remove every live calendar instance for the active workout, then delete the
-    # workout template itself and verify both operations.
     if operation == "delete_test_workout":
         try:
             return test_workout_calendar.describe(test_workout_calendar.delete_completely())
@@ -155,7 +151,6 @@ def workout_mutation(message: str, operation: str) -> str:
 
 
 def apply_direct_update(parsed_intent: dict) -> str:
-    """Update the active test workout in place using Garmin's native PUT endpoint."""
     try:
         result = garmin_workout_workspace.update_test(parsed_intent)
         return garmin_workout_workspace.describe(result)
@@ -175,7 +170,6 @@ def handle_action_bundle(message: str) -> str | None:
         return workout_mutation(message, "delete_test_workout")
 
     replies: list[str] = []
-
     if bundle.get("update_requested"):
         if bundle.get("has_update_parameters"):
             replies.append(apply_direct_update(bundle.get("parsed_intent") or {}))
@@ -194,7 +188,6 @@ def handle_action_bundle(message: str) -> str | None:
             replies.append(test_workout_calendar.handle_intent(intent))
         except Exception as exc:
             replies.append(f"Jeg forstod kalenderhandlingen, men Garmin kunne ikke gennemføre den sikkert: {exc}")
-
     return "\n\n".join(x for x in replies if x) or None
 
 
@@ -202,8 +195,8 @@ def answer(message: str) -> str:
     if wants_self_update(message):
         return start_self_update()
 
-    # Exact-week planning is always shadow/preview only. It is routed before the
-    # general LLM so 'lav uge 38' cannot degrade into a conversational guess.
+    # Weekly coaching must never fall through to the tiny chat model. This catches
+    # natural benchmark wording such as 'hvordan skal uge 38 se ud på baggrund af ...'.
     if wants_shadow_week(message):
         return shadow_week_answer(message)
 
@@ -217,10 +210,8 @@ def answer(message: str) -> str:
 
     intent = training_intent.deterministic(message)
     operation = str(intent.get("operation") or "")
-
     if operation in {"create_test_workout", "update_test_workout", "delete_test_workout"}:
         return workout_mutation(message, operation)
-
     if operation in {"schedule_test_workout", "move_test_workout", "unschedule_test_workout"}:
         try:
             return test_workout_calendar.handle_intent(intent)
@@ -236,4 +227,5 @@ fast.base.answer = answer
 
 if __name__ == "__main__":
     threading.Thread(target=fast.warm_model, daemon=True).start()
+    threading.Thread(target=model_manager.ensure_coach_model_background, daemon=True).start()
     raise SystemExit(fast.base.main())
