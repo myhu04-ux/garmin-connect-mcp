@@ -98,8 +98,8 @@ def test_invalid_adjust_preserves_existing() -> None:
         "source_date": iso(1),
         "source_workout_id": 11,
         "date": iso(1),
-        "family": "invented_workout",
         "reason": "model hallucination",
+        "family": "invented_workout",
     }]}
     plan = validate(raw, base_context(), library())
     assert len(plan["actions"]) == 1, plan
@@ -317,6 +317,11 @@ def test_natural_calendar_intents() -> None:
     schedule = deterministic("læg den i kalenderen på torsdag")
     assert schedule["operation"] == "schedule_test_workout", schedule
     assert schedule["target_date"], schedule
+    exact_user_phrase = deterministic("Put den i kalenderen til på torsdag")
+    assert exact_user_phrase["operation"] == "schedule_test_workout", exact_user_phrase
+    assert exact_user_phrase["target_date"], exact_user_phrase
+    shorthand = deterministic("læg den på torsdag")
+    assert shorthand["operation"] == "schedule_test_workout", shorthand
     move = deterministic("flyt den til fredag")
     assert move["operation"] == "move_test_workout", move
     assert move["target_date"], move
