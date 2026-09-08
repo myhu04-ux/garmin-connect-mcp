@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 
@@ -17,6 +18,7 @@ import coach_chat_fast as fast
 import conversation_router
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
+import shadow_week
 import test_workout_calendar
 import training_intent
 import workout_selfheal
@@ -65,6 +67,32 @@ def start_self_update() -> str:
         "opgraderer de fastlåste afhængigheder, kører tests og genstarter kun, hvis de består. "
         "Chatten kan forsvinde kortvarigt."
     )
+
+
+def wants_shadow_week(message: str) -> bool:
+    """Route an exact ISO-week planning request to the shadow planner, never Garmin writes."""
+    text = " ".join(message.casefold().strip().split())
+    if not re.search(r"\buge\s*\d{1,2}\b", text):
+        return False
+    phrases = (
+        "shadow",
+        "skyggeplan",
+        "træningsplan for uge",
+        "traeningsplan for uge",
+        "plan for uge",
+        "lav uge",
+        "planlæg uge",
+        "planlaeg uge",
+        "generer uge",
+    )
+    return any(p in text for p in phrases)
+
+
+def shadow_week_answer(message: str) -> str:
+    try:
+        return shadow_week.handle(message)
+    except Exception as exc:
+        return f"Jeg kunne ikke generere shadow-ugen sikkert: {exc}"
 
 
 def wants_catalog(message: str) -> bool:
@@ -173,6 +201,11 @@ def handle_action_bundle(message: str) -> str | None:
 def answer(message: str) -> str:
     if wants_self_update(message):
         return start_self_update()
+
+    # Exact-week planning is always shadow/preview only. It is routed before the
+    # general LLM so 'lav uge 38' cannot degrade into a conversational guess.
+    if wants_shadow_week(message):
+        return shadow_week_answer(message)
 
     automation = auto_calendar_control.handle(message)
     if automation is not None:
