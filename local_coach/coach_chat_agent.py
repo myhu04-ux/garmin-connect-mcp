@@ -16,6 +16,7 @@ import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import test_workout_calendar
 import training_intent
+import workout_replace_compat
 import workout_selfheal
 
 
@@ -56,6 +57,21 @@ def catalog_answer(message: str) -> str:
     return "\n".join(lines)
 
 
+def compatibility_update(message: str, parsed_intent: dict | None = None) -> str:
+    """Update the active test workout without assuming update_workout exists."""
+    try:
+        return workout_replace_compat.recover_message(message, parsed_intent)
+    except Exception as compat_error:
+        # The older master-shape self-heal is still useful for creation. For an
+        # update it may itself require update_workout, so preserve both errors.
+        try:
+            return workout_selfheal.recover(message)
+        except Exception as master_error:
+            raise RuntimeError(
+                f"Kompatibilitets-self-heal fejlede: {compat_error}. Garmin-master self-heal: {master_error}"
+            ) from master_error
+
+
 def workout_mutation(message: str, operation: str) -> str:
     if operation == "delete_test_workout":
         try:
@@ -69,7 +85,15 @@ def workout_mutation(message: str, operation: str) -> str:
         result = garmin_workout_workspace.handle(message)
         return result or "Workout-handlingen blev gennemført."
     except Exception as first_error:
-        if operation in {"create_test_workout", "update_test_workout"}:
+        if operation == "update_test_workout":
+            try:
+                return compatibility_update(message)
+            except Exception as second_error:
+                return (
+                    "Jeg kunne ikke gennemføre ændringen, selv efter automatisk kompatibilitets-self-heal. "
+                    f"Første fejl: {first_error}. Self-heal: {second_error}"
+                )
+        if operation == "create_test_workout":
             try:
                 return workout_selfheal.recover(message)
             except Exception as second_error:
@@ -88,10 +112,10 @@ def apply_direct_update(message: str, parsed_intent: dict) -> str:
         return garmin_workout_workspace.describe(result)
     except Exception as first_error:
         try:
-            return workout_selfheal.recover(message)
+            return compatibility_update(message, parsed_intent)
         except Exception as second_error:
             return (
-                "Jeg forstod ændringen, men Garmin-verifikationen lykkedes ikke. "
+                "Jeg forstod ændringen, men den kunne ikke gennemføres efter automatisk self-heal. "
                 f"Standardforsøg: {first_error}. Self-heal: {second_error}"
             )
 
