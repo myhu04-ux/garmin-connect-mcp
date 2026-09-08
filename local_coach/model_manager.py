@@ -17,7 +17,9 @@ import requests
 
 OLLAMA_ROOT = "http://127.0.0.1:11434"
 FAST_MODEL = "qwen3:1.7b"
-COACH_MODEL = "qwen3:4b-instruct"
+# Official Ollama library tag. 8B is intentionally chosen for weekly/deep coaching
+# quality; the Acer has ample system RAM even if the whole model cannot stay in VRAM.
+COACH_MODEL = "qwen3:8b"
 STATUS = Path(r"C:\GarminCoach\data\model_status.json")
 _LOCK = threading.Lock()
 _PULL_THREAD: threading.Thread | None = None
@@ -75,7 +77,7 @@ def pull_model(model: str = COACH_MODEL) -> None:
             f"{OLLAMA_ROOT}/api/pull",
             json={"model": model, "stream": True},
             stream=True,
-            timeout=(10, 60 * 30),
+            timeout=(10, 60 * 45),
         ) as response:
             response.raise_for_status()
             last_pct = 0
