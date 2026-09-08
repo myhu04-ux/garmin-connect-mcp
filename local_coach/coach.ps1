@@ -12,9 +12,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = 'C:\GarminCoach'
 $repo = Join-Path $root 'garmin-connect-mcp'
+$coachDir = Join-Path $repo 'local_coach'
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $data = Join-Path $root 'data'
 $dashboard = Join-Path $data 'DAGENS_COACH.html'
+$testManifest = Join-Path $coachDir 'regression_tests.txt'
 $gitCandidates = @(
     'C:\Program Files\Git\cmd\git.exe',
     'C:\Program Files\Git\bin\git.exe',
@@ -27,7 +29,16 @@ if (-not (Test-Path $repo)) { throw "Projektmappe mangler: $repo" }
 New-Item -ItemType Directory -Force -Path $data | Out-Null
 
 function Script-Path([string]$Name) {
-    return Join-Path $repo ("local_coach\" + $Name)
+    return Join-Path $coachDir $Name
+}
+
+function Regression-TestNames {
+    if (-not (Test-Path $testManifest)) { throw "Regressionstest-manifest mangler: $testManifest" }
+    return @(
+        Get-Content -Path $testManifest |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith('#') }
+    )
 }
 
 function Run-CoachScript([string]$Name, [string[]]$Arguments = @(), [switch]$Required) {
@@ -61,8 +72,6 @@ function Ensure-Templates([switch]$Force) {
 
 function Build-CoachOutput([switch]$ForcePlan) {
     Run-CoachScript 'coach_brief_v2.py' -Required
-    # The rolling adaptive planner uses hidden Qwen3 thinking; only its final JSON is
-    # persisted and it still passes through deterministic validation afterwards.
     if ($ForcePlan) {
         Run-CoachScript 'adaptive_preview_thinking.py' @('--force') -Required
     } else {
@@ -127,17 +136,7 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Git pull fejlede.' }
             & $python -m pip install --upgrade -e $repo
             if ($LASTEXITCODE -ne 0) { throw 'Python-opdatering fejlede.' }
-            foreach ($testName in @(
-                'self_test.py',
-                'intent_self_test.py',
-                'router_self_test.py',
-                'shadow_week_self_test.py',
-                'coach_benchmark_self_test.py',
-                'coach_routing_self_test.py',
-                'core_evidence_self_test.py',
-                'planned_workout_compiler_self_test.py',
-                'writeback_transaction_self_test.py'
-            )) {
+            foreach ($testName in Regression-TestNames) {
                 Run-CoachScript $testName -Required
             }
             Run-Status
