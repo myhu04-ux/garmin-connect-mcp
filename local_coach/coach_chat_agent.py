@@ -1,9 +1,9 @@
 """Tool-aware local coach chat entrypoint.
 
 Ordinary Danish is routed to deterministic Garmin tools first. Exact-week planning
-and deeper coaching use the larger local expert model with multi-week Garmin/health
-context; only short/simple chat uses the small fast model. Garmin writes never depend
-on free-form LLM interpretation.
+and all genuinely free-form coaching use the larger local expert model with multi-week
+Garmin/health context. The small model is only an internal constrained parser in tools;
+it is not the athlete-facing coach. Garmin writes never depend on free-form LLM text.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def start_self_update() -> str:
 
 
 def wants_shadow_week(message: str) -> bool:
-    """Catch natural weekly coaching questions before they reach the small chat model."""
+    """Catch natural weekly coaching questions before generic conversation."""
     text = " ".join(message.casefold().strip().split())
     if not re.search(r"\buge\s*\d{1,2}\b", text):
         return False
@@ -96,7 +96,6 @@ def shadow_week_answer(message: str) -> str:
 
 
 def wants_deep_coaching(message: str) -> bool:
-    """Route synthesis/trend questions to 8B, while leaving short factual chat fast."""
     text = " ".join(message.casefold().strip().split())
     deep_phrases = (
         "sidste uger", "seneste uger", "de sidste uger", "de seneste uger",
@@ -108,7 +107,6 @@ def wants_deep_coaching(message: str) -> bool:
     )
     if any(phrase in text for phrase in deep_phrases):
         return True
-    # Longer questions spanning both coaching and health/goal domains deserve the expert path.
     coaching_domain = any(word in text for word in (
         "træning", "traening", "løb", "loeb", "trail", "maraton", "mål", "maal", "form",
     ))
@@ -215,6 +213,13 @@ def handle_action_bundle(message: str) -> str | None:
     return "\n\n".join(x for x in replies if x) or None
 
 
+def expert_answer(message: str) -> str:
+    try:
+        return expert_chat.answer(message)
+    except Exception as exc:
+        return f"Ekspertcoachen kunne ikke afslutte analysen sikkert: {exc}"
+
+
 def answer(message: str) -> str:
     if wants_self_update(message):
         return start_self_update()
@@ -243,20 +248,16 @@ def answer(message: str) -> str:
     if wants_catalog(message):
         return catalog_answer(message)
 
-    # Deep synthesis is deliberately chosen before the 1.7B fallback. Simple factual
-    # recovery/upcoming/challenge questions remain handled by fast deterministic tools.
-    if wants_deep_coaching(message):
-        try:
-            return expert_chat.answer(message)
-        except Exception as exc:
-            return f"Ekspertcoachen kunne ikke afslutte analysen sikkert: {exc}"
-
-    return fast.fast_answer(message)
+    # Fast path is now deterministic/tool-only. If it cannot answer from known
+    # local facts, the athlete-facing free-form answer always comes from 8B.
+    direct = fast.direct_tool_answer(message)
+    if direct is not None:
+        return direct
+    return expert_answer(message)
 
 
 fast.base.answer = answer
 
 if __name__ == "__main__":
-    threading.Thread(target=fast.warm_model, daemon=True).start()
     threading.Thread(target=model_manager.ensure_coach_model_background, daemon=True).start()
     raise SystemExit(fast.base.main())
