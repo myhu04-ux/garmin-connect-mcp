@@ -1,0 +1,78 @@
+name: Activate Final Coach Agent
+
+on:
+  push:
+    branches:
+      - feature/local-training-coach
+
+permissions:
+  contents: write
+
+jobs:
+  activate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/local-training-coach
+          fetch-depth: 0
+
+      - name: Wait for older activation workflow and refresh branch
+        shell: bash
+        run: |
+          sleep 25
+          git fetch origin feature/local-training-coach
+          git reset --hard origin/feature/local-training-coach
+
+      - name: Install final compatibility entrypoint and manifest additions
+        shell: bash
+        run: |
+          cat > local_coach/coach_chat_agent.py <<'PY'
+          """Compatibility entrypoint for the final local Garmin coach agent.
+
+          The implementation is split into coach_chat_agent_core (stable Garmin/model
+          routing) and coach_chat_agent_v2 (natural sourced goal/plan research). This
+          filename is preserved for existing Windows startup/scheduler configuration.
+          """
+
+          from __future__ import annotations
+
+          import threading
+
+          import coach_chat_agent_core as core
+          import coach_chat_agent_v2 as app
+          import model_manager
+
+          # Compatibility exports used by regression tests and any older local code.
+          fast = core.fast
+          conversation_chat = core.conversation_chat
+          expert_chat = core.expert_chat
+          wants_catalog = core.wants_catalog
+          wants_shadow_week = core.wants_shadow_week
+          wants_deep_coaching = core.wants_deep_coaching
+          stage = core.stage
+          answer = app.answer
+
+          fast.base.answer = answer
+
+          if __name__ == "__main__":
+              threading.Thread(target=model_manager.ensure_all_models_background, daemon=True).start()
+              raise SystemExit(fast.base.main())
+          PY
+
+          grep -qxF 'research_intent_self_test.py' local_coach/regression_tests.txt || echo 'research_intent_self_test.py' >> local_coach/regression_tests.txt
+
+      - name: Commit migration only if needed
+        shell: bash
+        run: |
+          if git diff --quiet -- local_coach/coach_chat_agent.py local_coach/regression_tests.txt; then
+            echo "Final coach entrypoint and manifest already active."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add local_coach/coach_chat_agent.py local_coach/regression_tests.txt
+          git commit -m "Activate final researched coach chat router"
+          git push origin HEAD:feature/local-training-coach
