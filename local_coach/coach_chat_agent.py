@@ -1,10 +1,8 @@
 """Tool-aware local coach chat entrypoint.
 
-The athlete speaks ordinary Danish. The agent owns constrained Garmin tools for
-workout create/update/delete, calendar placement, Garmin discovery and explicit
-enable/disable of adaptive calendar write-back. Workout create/update gets one
-automatic self-heal retry using the athlete's approved Garmin master shape before an
-error is surfaced.
+The athlete speaks ordinary Danish. Known Garmin actions are routed deterministically
+before the LLM, including inflected Danish wording and compound requests. Qwen is only
+used for genuine coaching conversation, never to improvise a known Garmin mutation.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ import threading
 
 import auto_calendar_control
 import coach_chat_fast as fast
+import conversation_router
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import test_workout_calendar
@@ -82,10 +81,64 @@ def workout_mutation(message: str, operation: str) -> str:
         return f"Jeg forstod Garmin-handlingen, men gennemførte den ikke: {first_error}"
 
 
+def apply_direct_update(message: str, parsed_intent: dict) -> str:
+    """Apply an already parsed test-workout edit without reparsing a compound sentence."""
+    try:
+        result = garmin_workout_workspace.update_test(parsed_intent)
+        return garmin_workout_workspace.describe(result)
+    except Exception as first_error:
+        try:
+            return workout_selfheal.recover(message)
+        except Exception as second_error:
+            return (
+                "Jeg forstod ændringen, men Garmin-verifikationen lykkedes ikke. "
+                f"Standardforsøg: {first_error}. Self-heal: {second_error}"
+            )
+
+
+def handle_action_bundle(message: str) -> str | None:
+    bundle = conversation_router.route(message)
+    if not bundle.get("actionish") and not bundle.get("incomplete_calendar"):
+        return None
+
+    if bundle.get("incomplete_calendar"):
+        return "Jeg forstår, at du vil flytte eller placere testpasset i kalenderen. Hvilken dag skal det ligge?"
+
+    if bundle.get("delete_workout"):
+        return workout_mutation(message, "delete_test_workout")
+
+    replies: list[str] = []
+
+    if bundle.get("update_requested"):
+        if bundle.get("has_update_parameters"):
+            replies.append(apply_direct_update(message, bundle.get("parsed_intent") or {}))
+        else:
+            replies.append(
+                "Jeg forstår, at testpasset skal være kortere/ændres, men du har ikke angivet hvor meget. "
+                "Jeg ændrer derfor ikke selve workoutet på gæt. Skriv fx 'gør den 10 minutter kortere'."
+            )
+
+    calendar_op = bundle.get("calendar_operation")
+    if calendar_op:
+        intent = dict(bundle.get("parsed_intent") or {})
+        intent["operation"] = calendar_op
+        intent["target_date"] = bundle.get("target_date")
+        try:
+            replies.append(test_workout_calendar.handle_intent(intent))
+        except Exception as exc:
+            replies.append(f"Jeg forstod kalenderhandlingen, men gennemførte den ikke: {exc}")
+
+    return "\n\n".join(x for x in replies if x) or None
+
+
 def answer(message: str) -> str:
     automation = auto_calendar_control.handle(message)
     if automation is not None:
         return automation
+
+    routed = handle_action_bundle(message)
+    if routed is not None:
+        return routed
 
     intent = training_intent.deterministic(message)
     operation = str(intent.get("operation") or "")
