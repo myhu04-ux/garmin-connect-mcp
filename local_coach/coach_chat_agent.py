@@ -1,9 +1,9 @@
 """Tool-aware local coach chat entrypoint.
 
 Ordinary Danish is routed to deterministic Garmin tools first. Exact-week planning
-and all genuinely free-form coaching use the larger local expert model with multi-week
-Garmin/health context. The small model is only an internal constrained parser in tools;
-it is not the athlete-facing coach. Garmin writes never depend on free-form LLM text.
+and deep synthesis use the 8B expert model; ordinary free-form conversation uses the
+4B local coach. The 1.7B model is internal parser-only. Garmin writes never depend on
+free-form LLM text.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import threading
 
 import auto_calendar_control
 import coach_chat_fast as fast
+import conversation_chat
 import conversation_router
 import expert_chat
 import garmin_method_catalog as catalog
@@ -73,7 +74,6 @@ def start_self_update() -> str:
 
 
 def wants_shadow_week(message: str) -> bool:
-    """Catch natural weekly coaching questions before generic conversation."""
     text = " ".join(message.casefold().strip().split())
     if not re.search(r"\buge\s*\d{1,2}\b", text):
         return False
@@ -90,7 +90,7 @@ def shadow_week_answer(message: str) -> str:
         return shadow_week_expert.handle(message)
     except Exception as exc:
         text = str(exc)
-        if "coach-model" in text or "installeres lokalt" in text or "qwen3:8b" in text:
+        if "Ekspertmodellen" in text or "installeres lokalt" in text or "qwen3:8b" in text:
             return text
         return f"Jeg kunne ikke generere ugeplanen sikkert: {text}"
 
@@ -213,11 +213,18 @@ def handle_action_bundle(message: str) -> str | None:
     return "\n\n".join(x for x in replies if x) or None
 
 
-def expert_answer(message: str) -> str:
+def deep_answer(message: str) -> str:
     try:
         return expert_chat.answer(message)
     except Exception as exc:
         return f"Ekspertcoachen kunne ikke afslutte analysen sikkert: {exc}"
+
+
+def normal_answer(message: str) -> str:
+    try:
+        return conversation_chat.answer(message)
+    except Exception as exc:
+        return f"Samtalecoachen kunne ikke afslutte svaret sikkert: {exc}"
 
 
 def answer(message: str) -> str:
@@ -248,16 +255,17 @@ def answer(message: str) -> str:
     if wants_catalog(message):
         return catalog_answer(message)
 
-    # Fast path is now deterministic/tool-only. If it cannot answer from known
-    # local facts, the athlete-facing free-form answer always comes from 8B.
     direct = fast.direct_tool_answer(message)
     if direct is not None:
         return direct
-    return expert_answer(message)
+
+    if wants_deep_coaching(message):
+        return deep_answer(message)
+    return normal_answer(message)
 
 
 fast.base.answer = answer
 
 if __name__ == "__main__":
-    threading.Thread(target=model_manager.ensure_coach_model_background, daemon=True).start()
+    threading.Thread(target=model_manager.ensure_all_models_background, daemon=True).start()
     raise SystemExit(fast.base.main())
