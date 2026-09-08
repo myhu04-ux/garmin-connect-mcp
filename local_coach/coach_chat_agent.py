@@ -1,8 +1,9 @@
 """Tool-aware local coach chat entrypoint.
 
 Ordinary Danish is routed to deterministic Garmin tools first. Exact-week planning
-uses a larger local expert model and rich multi-week Garmin/health context; short chat
-uses the small fast model. Garmin writes never depend on free-form LLM interpretation.
+and deeper coaching use the larger local expert model with multi-week Garmin/health
+context; only short/simple chat uses the small fast model. Garmin writes never depend
+on free-form LLM interpretation.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import threading
 import auto_calendar_control
 import coach_chat_fast as fast
 import conversation_router
+import expert_chat
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import model_manager
@@ -71,14 +73,14 @@ def start_self_update() -> str:
 
 
 def wants_shadow_week(message: str) -> bool:
-    """Catch natural weekly coaching questions before they ever reach the 1.7B chat model."""
+    """Catch natural weekly coaching questions before they reach the small chat model."""
     text = " ".join(message.casefold().strip().split())
     if not re.search(r"\buge\s*\d{1,2}\b", text):
         return False
     planning_words = (
         "shadow", "skyggeplan", "plan", "planlæg", "planlaeg", "generer", "træning", "traening",
         "træne", "traene", "hvordan skal", "se ud", "helbred", "restitution", "baseret på", "baseret paa",
-        "sidste uger", "seneste uger", "empiri", "evidens",
+        "sidste uger", "seneste uger", "empiri", "evidens", "bør jeg", "boer jeg",
     )
     return any(word in text for word in planning_words)
 
@@ -91,6 +93,29 @@ def shadow_week_answer(message: str) -> str:
         if "coach-model" in text or "installeres lokalt" in text or "qwen3:8b" in text:
             return text
         return f"Jeg kunne ikke generere ugeplanen sikkert: {text}"
+
+
+def wants_deep_coaching(message: str) -> bool:
+    """Route synthesis/trend questions to 8B, while leaving short factual chat fast."""
+    text = " ".join(message.casefold().strip().split())
+    deep_phrases = (
+        "sidste uger", "seneste uger", "de sidste uger", "de seneste uger",
+        "træningsbelast", "traeningsbelast", "training load", "progression", "udvikling",
+        "på sporet", "paa sporet", "ligger jeg", "frem mod", "hvordan bør", "hvordan boer",
+        "hvad bør", "hvad boer", "vurder min", "analys", "sammenhold", "tilpas",
+        "adaptiv", "helbred og træning", "helbred og traening", "restitution og træning",
+        "restitution og traening", "målrettet mod", "maalrettet mod",
+    )
+    if any(phrase in text for phrase in deep_phrases):
+        return True
+    # Longer questions spanning both coaching and health/goal domains deserve the expert path.
+    coaching_domain = any(word in text for word in (
+        "træning", "traening", "løb", "loeb", "trail", "maraton", "mål", "maal", "form",
+    ))
+    health_domain = any(word in text for word in (
+        "helbred", "restitution", "hrv", "søvn", "soevn", "hvilepuls", "stress", "body battery",
+    ))
+    return len(text) >= 180 and coaching_domain and health_domain
 
 
 def wants_catalog(message: str) -> bool:
@@ -217,6 +242,15 @@ def answer(message: str) -> str:
 
     if wants_catalog(message):
         return catalog_answer(message)
+
+    # Deep synthesis is deliberately chosen before the 1.7B fallback. Simple factual
+    # recovery/upcoming/challenge questions remain handled by fast deterministic tools.
+    if wants_deep_coaching(message):
+        try:
+            return expert_chat.answer(message)
+        except Exception as exc:
+            return f"Ekspertcoachen kunne ikke afslutte analysen sikkert: {exc}"
+
     return fast.fast_answer(message)
 
 
