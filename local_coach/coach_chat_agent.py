@@ -1,9 +1,9 @@
 """Tool-aware local coach chat entrypoint.
 
-Extends coach_chat_fast with a read-only Garmin method catalog. The coach can search
-what the installed Garmin client exposes without invoking unknown endpoints. Known
-domains (challenges and workout format) are handled by explicit safe tools in
-coach_chat_fast.
+Extends coach_chat_fast with Garmin discovery and a tightly scoped calendar tool for
+the active CoachTest workout. The athlete speaks ordinary Danish. Read-only discovery
+never invokes unknown endpoints; explicit calendar requests can only schedule/move/
+unschedule the one active test workout and are verified by Garmin read-back.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import threading
 
 import coach_chat_fast as fast
 import garmin_method_catalog as catalog
+import test_workout_calendar
+import training_intent
 
 
 def wants_catalog(message: str) -> bool:
@@ -52,6 +54,12 @@ def catalog_answer(message: str) -> str:
 
 
 def answer(message: str) -> str:
+    intent = training_intent.deterministic(message)
+    if intent.get("operation") in {"schedule_test_workout", "move_test_workout", "unschedule_test_workout"}:
+        try:
+            return test_workout_calendar.handle_intent(intent)
+        except Exception as exc:
+            return f"Jeg forstod kalenderhandlingen, men gennemførte den ikke: {exc}"
     if wants_catalog(message):
         return catalog_answer(message)
     return fast.fast_answer(message)
