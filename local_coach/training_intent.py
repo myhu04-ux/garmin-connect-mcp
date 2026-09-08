@@ -51,10 +51,16 @@ def _num(pattern: str, text: str) -> float | None:
 def deterministic(message: str) -> dict[str, Any]:
     text = message.casefold().strip()
     explicit_test = any(k in text for k in ("test-løb", "test løb", "testløb", "test-workout", "test workout", "testpas", "test-pas"))
+    refers_to_plan = any(k in text for k in ("planen", "ugen", "kalender", "næste uge", "hele planen"))
+    followup_delete = (not refers_to_plan) and any(k in text for k in ("slet den", "fjern den", "slet løbet", "fjern løbet", "delete den"))
+    followup_update = (not refers_to_plan) and any(k in text for k in (
+        "juster den", "justér den", "juster løbet", "ændr den", "ændr løbet", "ret den",
+        "gør den", "lav den om", "kort den", "forlæng den", "skift den", "skift til",
+    ))
 
-    if explicit_test and any(k in text for k in ("slet", "fjern", "delete")):
+    if (explicit_test and any(k in text for k in ("slet", "fjern", "delete"))) or followup_delete:
         operation = "delete_test_workout"
-    elif explicit_test and any(k in text for k in ("juster", "ændr", "ret ", "gør den", "lav den om", "opdater")):
+    elif (explicit_test and any(k in text for k in ("juster", "justér", "ændr", "ret ", "gør den", "lav den om", "opdater"))) or followup_update:
         operation = "update_test_workout"
     elif explicit_test and any(k in text for k in ("lav", "opret", "byg", "create", "kan du")):
         operation = "create_test_workout"
