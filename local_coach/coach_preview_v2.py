@@ -3,6 +3,8 @@
 The language model proposes coaching actions; Python owns dates, safety, athlete
 constraints, plan naming and approved Garmin templates. Today's session can be
 shown, but new/changed sessions are never written for today retroactively.
+Garmin challenges are secondary goals and local coach-chat notes are explicit
+athlete constraints/preferences.
 """
 
 from __future__ import annotations
@@ -38,6 +40,29 @@ RED_DOWNGRADE = {
     "long_trail": "trail_easy",
     "back_to_back": "trail_easy",
 }
+
+_ORIGINAL_BUILD_CONTEXT = base.build_context
+
+
+def build_context(
+    state: dict[str, Any],
+    calendar: dict[str, Any],
+    library: dict[str, Any],
+    knowledge: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    context = _ORIGINAL_BUILD_CONTEXT(state, calendar, library, knowledge, profile)
+    context["garmin_challenges"] = state.get("garmin_challenges") or []
+    context["athlete_notes"] = state.get("athlete_notes") or []
+    rules = context.setdefault("rules", {})
+    rules.update({
+        "athlete_notes_are_constraints_if_safe": True,
+        "garmin_challenges_are_secondary_goals": True,
+        "never_add_unsafe_catchup_volume_for_challenge": True,
+        "recovery_event_and_safe_progression_override_challenges": True,
+        "compatible_existing_training_should_count_toward_challenges_when_possible": True,
+    })
+    return context
 
 
 def date_of(value: Any) -> dt.date | None:
@@ -323,10 +348,13 @@ def validate(raw: dict[str, Any], context: dict[str, Any], library: dict[str, An
         "focus_next_14_days": [str(x)[:400] for x in (raw.get("focus_next_14_days") or [])[:5]],
         "coach_note": str(raw.get("coach_note") or "")[:800],
         "external_principles_available": context.get("external_plan_principles", []),
+        "garmin_challenges_considered": context.get("garmin_challenges", []),
+        "athlete_notes_considered": context.get("athlete_notes", []),
     }
 
 
 base.allowed_dates = planning_dates
+base.build_context = build_context
 base.validate = validate
 
 if __name__ == "__main__":
