@@ -11,9 +11,11 @@ $repo = Join-Path $root 'garmin-connect-mcp'
 $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
 $chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
+$selfUpdate = Join-Path $repo 'local_coach\self_update.ps1'
 $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $taskName = 'Garmin Local Coach - Auto'
+$updateTaskName = 'Garmin Local Coach - Update'
 $startupDir = [Environment]::GetFolderPath('Startup')
 $uiLauncher = Join-Path $startupDir 'Garmin Local Coach UI.vbs'
 $desktop = [Environment]::GetFolderPath('Desktop')
@@ -71,6 +73,19 @@ IconFile=%SystemRoot%\System32\shell32.dll
 IconIndex=14
 "@
         Set-Content -Path $chatUrlFile -Value $chatUrl -Encoding ASCII
+    }
+
+    # Safe code update at Windows logon. The updater waits briefly for network,
+    # refuses dirty repositories, tests the new version, and rolls back on failure.
+    if (Test-Path $selfUpdate) {
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $updateCommand = '"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -StartupCheck -NoBrowser' -f $powershell, $selfUpdate
+        schtasks.exe /Create /TN $updateTaskName /TR $updateCommand /SC ONLOGON /F | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Selvopdatering ved login: $updateTaskName"
+        } else {
+            Write-Host 'ADVARSEL: Selvopdaterings-task kunne ikke oprettes; chatkommandoen kan stadig bruges.' -ForegroundColor Yellow
+        }
     }
 
     Write-Host "UI autostart: $uiLauncher"
