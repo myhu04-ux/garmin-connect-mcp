@@ -6,6 +6,7 @@ $python = Join-Path $root '.venv\Scripts\python.exe'
 $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
 $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
+$chat = Join-Path $repo 'local_coach\coach_chat_ui.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
@@ -15,6 +16,7 @@ Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundC
 if (-not (Test-Path $python)) { throw "Mangler Python-miljø: $python" }
 if (-not (Test-Path $coach)) { throw "Mangler coach-motor: $coach" }
 if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
+if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
 
 Write-Host "`n1/6 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
 & $python -m pip install -e $repo
@@ -41,7 +43,7 @@ Write-Host "`n3/6 Kører offline sikkerhedstests..." -ForegroundColor Cyan
 & $python $selfTest
 if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. Den gamle UI stoppes ikke.' }
 
-Write-Host "`n4/6 Installerer automatisk coach og UI-autostart..." -ForegroundColor Cyan
+Write-Host "`n4/6 Installerer automatisk coach, dashboard og direkte chat..." -ForegroundColor Cyan
 try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $automation -Days 'MON,THU,SUN' -Time '22:00' -InstallUiStartup
     if ($LASTEXITCODE -ne 0) { throw 'Scheduler returnerede fejl.' }
@@ -50,10 +52,10 @@ try {
     Write-Host 'UI kan stadig bruges; automatik kan installeres fra UI senere.' -ForegroundColor Yellow
 }
 
-Write-Host "`n5/6 Genstarter coach-UI sikkert..." -ForegroundColor Cyan
+Write-Host "`n5/6 Genstarter dashboard og coach-chat sikkert..." -ForegroundColor Cyan
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like '*local_coach*coach_ui.py*' } |
+        Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_ui.py*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 } catch {
     Write-Host "ADVARSEL: Kunne ikke stoppe gammel UI automatisk: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -61,17 +63,28 @@ try {
 Start-Sleep -Milliseconds 800
 $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
 Start-Process -FilePath $uiPython -ArgumentList @($ui, '--no-browser') -WindowStyle Hidden
+Start-Process -FilePath $uiPython -ArgumentList @($chat) -WindowStyle Hidden
 
-$ready = $false
-for ($i = 0; $i -lt 15; $i++) {
+$dashboardReady = $false
+$chatReady = $false
+for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
-    try {
-        Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -Method Get -TimeoutSec 2 | Out-Null
-        $ready = $true
-        break
-    } catch {}
+    if (-not $dashboardReady) {
+        try {
+            Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -Method Get -TimeoutSec 2 | Out-Null
+            $dashboardReady = $true
+        } catch {}
+    }
+    if (-not $chatReady) {
+        try {
+            Invoke-RestMethod -Uri 'http://127.0.0.1:8766/api/status' -Method Get -TimeoutSec 2 | Out-Null
+            $chatReady = $true
+        } catch {}
+    }
+    if ($dashboardReady -and $chatReady) { break }
 }
-if (-not $ready) { throw 'Coach-UI startede ikke på http://127.0.0.1:8765/' }
+if (-not $dashboardReady) { throw 'Coach-dashboard startede ikke på http://127.0.0.1:8765/' }
+if (-not $chatReady) { throw 'Coach-chat startede ikke på http://127.0.0.1:8766/' }
 
 Write-Host "`n6/6 Starter frisk Garmin-opdatering gennem UI'et..." -ForegroundColor Cyan
 try {
@@ -84,7 +97,8 @@ try {
 Start-Process 'http://127.0.0.1:8765/'
 
 Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
-Write-Host 'UI: http://127.0.0.1:8765/'
-Write-Host 'Den friske Garmin-kørsel ejes af UI-processen, så status og fejl kan ses i browseren.'
+Write-Host 'Dashboard: http://127.0.0.1:8765/'
+Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
+Write-Host 'Der er også oprettet en skrivebordsgenvej til coach-chatten.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
-Write-Host 'Garmin write-back er fortsat OFF indtil én kalenderændring er testet fra UI.' -ForegroundColor Yellow
+Write-Host 'Garmin write-back er fortsat låst indtil én kalenderændring er testet fra UI.' -ForegroundColor Yellow
