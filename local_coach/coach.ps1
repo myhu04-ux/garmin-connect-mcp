@@ -61,15 +61,12 @@ function Ensure-Templates([switch]$Force) {
 
 function Build-CoachOutput([switch]$ForcePlan) {
     Run-CoachScript 'coach_brief_v2.py' -Required
-    # Deep/adaptive decisions use the larger local expert model. The script caches
-    # on coaching-relevant inputs; --force is reserved for an explicit forced plan.
     if ($ForcePlan) {
         Run-CoachScript 'adaptive_preview_expert.py' @('--force') -Required
     } else {
         Run-CoachScript 'adaptive_preview_expert.py' -Required
     }
     Run-CoachScript 'preview_integrity.py' -Required
-    # Dashboard wording remains deterministic; free-form analysis lives in expert chat.
     Run-CoachScript 'coach_voice_fast.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
 }
@@ -101,13 +98,11 @@ function Run-Status([switch]$RefreshTemplates, [switch]$ForcePlan) {
 }
 
 function Run-Auto {
-    # Scheduled runs explicitly request a fresh expert decision. This is where the
-    # adaptive coach may revise the next 7 days before guarded calendar write-back.
+    # Scheduled runs explicitly request a fresh expert decision. The guarded writer
+    # still refuses changes until the write-back test and explicit enable are passed.
     Run-Status -ForcePlan
     Run-CoachScript 'calendar_writer_safe.py' @('--apply') -Required
     Run-CoachScript 'calendar_probe.py' -Required
-    # Reconcile the dashboard with the now-current Garmin calendar. Input caching
-    # prevents a duplicate expert call if the calendar/plan context is unchanged.
     Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 }
@@ -132,7 +127,17 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Git pull fejlede.' }
             & $python -m pip install --upgrade -e $repo
             if ($LASTEXITCODE -ne 0) { throw 'Python-opdatering fejlede.' }
-            foreach ($testName in @('self_test.py','intent_self_test.py','router_self_test.py','shadow_week_self_test.py','coach_benchmark_self_test.py')) {
+            foreach ($testName in @(
+                'self_test.py',
+                'intent_self_test.py',
+                'router_self_test.py',
+                'shadow_week_self_test.py',
+                'coach_benchmark_self_test.py',
+                'coach_routing_self_test.py',
+                'core_evidence_self_test.py',
+                'planned_workout_compiler_self_test.py',
+                'writeback_transaction_self_test.py'
+            )) {
                 Run-CoachScript $testName -Required
             }
             Run-Status
@@ -140,13 +145,13 @@ try {
         'goal' {
             if (-not $query) { $query = Read-Host 'Hvilket løb eller mål vil du træne mod?' }
             if (-not $query) { throw 'Der blev ikke angivet et mål.' }
-            Run-CoachScript 'event_research.py' @('--goal', $query) -Required
+            Run-CoachScript 'event_research_expert.py' @('--goal', $query) -Required
             Run-Status -ForcePlan
         }
         'plan' {
             if (-not $query) { $query = Read-Host 'Hvilket løbeprogram (navn eller URL) vil du bruge som inspiration?' }
             if (-not $query) { throw 'Der blev ikke angivet et program.' }
-            Run-CoachScript 'plan_research.py' @('--plan', $query) -Required
+            Run-CoachScript 'plan_research_expert.py' @('--plan', $query) -Required
             Run-Status -ForcePlan
         }
         'full' { Run-Status -RefreshTemplates -ForcePlan }
@@ -177,7 +182,4 @@ finally {
     $mutex.Dispose()
 }
 
-# Optional read-only collectors may have returned non-zero earlier in a successful
-# run. Normalize a genuinely completed pipeline to exit code 0 so the UI does not
-# show a false "Fejl (kode 1)" banner.
 exit 0
