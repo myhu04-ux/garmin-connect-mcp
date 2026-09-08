@@ -59,17 +59,22 @@ function Ensure-Templates([switch]$Force) {
     }
 }
 
-function Build-CoachOutput {
+function Build-CoachOutput([switch]$ForcePlan) {
     Run-CoachScript 'coach_brief_v2.py' -Required
-    # One compact Ollama pass makes the actual adaptive 7-day plan.
-    Run-CoachScript 'coach_preview_fast.py' -Required
+    # Deep/adaptive decisions use the larger local expert model. The script caches
+    # on coaching-relevant inputs; --force is reserved for an explicit forced plan.
+    if ($ForcePlan) {
+        Run-CoachScript 'adaptive_preview_expert.py' @('--force') -Required
+    } else {
+        Run-CoachScript 'adaptive_preview_expert.py' -Required
+    }
     Run-CoachScript 'preview_integrity.py' -Required
-    # Dashboard wording is deterministic; direct chat handles free-form conversation.
+    # Dashboard wording remains deterministic; free-form analysis lives in expert chat.
     Run-CoachScript 'coach_voice_fast.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
 }
 
-function Run-Status([switch]$RefreshTemplates) {
+function Run-Status([switch]$RefreshTemplates, [switch]$ForcePlan) {
     Ensure-Dependencies
     Write-Host "`n==============================================" -ForegroundColor Green
     Write-Host "        GARMIN LOCAL COACH - OPDATERING" -ForegroundColor Green
@@ -83,7 +88,7 @@ function Run-Status([switch]$RefreshTemplates) {
     Run-CoachScript 'health_history.py' @('--days','28','--refresh-days','3','--max-daily-calls','12')
     Run-CoachScript 'calendar_probe.py' -Required
     Ensure-Templates -Force:$RefreshTemplates
-    Build-CoachOutput
+    Build-CoachOutput -ForcePlan:$ForcePlan
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 
     Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
@@ -96,9 +101,13 @@ function Run-Status([switch]$RefreshTemplates) {
 }
 
 function Run-Auto {
-    Run-Status
+    # Scheduled runs explicitly request a fresh expert decision. This is where the
+    # adaptive coach may revise the next 7 days before guarded calendar write-back.
+    Run-Status -ForcePlan
     Run-CoachScript 'calendar_writer_safe.py' @('--apply') -Required
     Run-CoachScript 'calendar_probe.py' -Required
+    # Reconcile the dashboard with the now-current Garmin calendar. Input caching
+    # prevents a duplicate expert call if the calendar/plan context is unchanged.
     Build-CoachOutput
     Run-CoachScript 'coach_doctor.py' @('--mode','postflight','--max-age-minutes','30') -Required
 }
@@ -121,24 +130,26 @@ try {
             Write-Host "Opdaterer projektet fra GitHub..." -ForegroundColor Cyan
             & $git -C $repo pull --ff-only origin feature/local-training-coach
             if ($LASTEXITCODE -ne 0) { throw 'Git pull fejlede.' }
-            & $python -m pip install -e $repo
+            & $python -m pip install --upgrade -e $repo
             if ($LASTEXITCODE -ne 0) { throw 'Python-opdatering fejlede.' }
-            Run-CoachScript 'self_test.py' -Required
+            foreach ($testName in @('self_test.py','intent_self_test.py','router_self_test.py','shadow_week_self_test.py','coach_benchmark_self_test.py')) {
+                Run-CoachScript $testName -Required
+            }
             Run-Status
         }
         'goal' {
             if (-not $query) { $query = Read-Host 'Hvilket løb eller mål vil du træne mod?' }
             if (-not $query) { throw 'Der blev ikke angivet et mål.' }
             Run-CoachScript 'event_research.py' @('--goal', $query) -Required
-            Run-Status
+            Run-Status -ForcePlan
         }
         'plan' {
             if (-not $query) { $query = Read-Host 'Hvilket løbeprogram (navn eller URL) vil du bruge som inspiration?' }
             if (-not $query) { throw 'Der blev ikke angivet et program.' }
             Run-CoachScript 'plan_research.py' @('--plan', $query) -Required
-            Run-Status
+            Run-Status -ForcePlan
         }
-        'full' { Run-Status -RefreshTemplates }
+        'full' { Run-Status -RefreshTemplates -ForcePlan }
         'auto' { Run-Auto }
         'doctor' { Run-CoachScript 'coach_doctor.py' @('--mode','postflight') -Required }
         'test-writeback' {
