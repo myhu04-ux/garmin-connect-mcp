@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import datetime as dt
 
+from challenge_probe import collect_items
 from coach_preview_v2 import decorate, validate
 from named_workout import sanitized_copy
 from plan_identity import position_for
 from plan_matcher import match_recent_plan
+from workout_lab import semantic_signature, validation_errors
 
 
 def iso(days: int) -> str:
@@ -185,6 +187,71 @@ def test_named_clone_sanitizes_without_mutating_master() -> None:
     assert has_step_id(master), master
 
 
+def test_in_progress_badge_shape_is_detected() -> None:
+    raw = [{
+        "badgeId": 909,
+        "badgeName": "10 km weekend",
+        "badgeProgressValue": 4.2,
+        "badgeGoalValue": 10.0,
+        "earnPeriodStartDate": iso(-1),
+        "earnPeriodEndDate": iso(2),
+        "badgeStatus": "IN_PROGRESS",
+    }]
+    rows = collect_items(raw, "in_progress_badges")
+    assert len(rows) == 1, rows
+    assert rows[0]["name"] == "10 km weekend", rows
+    assert rows[0]["goal"] == 10.0 and rows[0]["progress"] == 4.2, rows
+    assert abs(rows[0]["remaining"] - 5.8) < 0.001, rows
+
+
+def test_workout_lab_accepts_running_structure() -> None:
+    workout = {
+        "workoutName": "LAB-Test",
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 1,
+                    "stepType": {"stepTypeKey": "warmup"},
+                    "endCondition": {"conditionTypeKey": "time"},
+                    "endConditionValue": 600.0,
+                    "targetType": {"workoutTargetTypeKey": "heart.rate.zone"},
+                    "targetValueOne": 2,
+                    "targetValueTwo": 2,
+                },
+                {
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 2,
+                    "stepType": {"stepTypeKey": "interval"},
+                    "endCondition": {"conditionTypeKey": "distance"},
+                    "endConditionValue": 5000.0,
+                    "targetType": {"workoutTargetTypeKey": "heart.rate.zone"},
+                    "targetValueOne": 2,
+                    "targetValueTwo": 2,
+                },
+                {
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 3,
+                    "stepType": {"stepTypeKey": "cooldown"},
+                    "endCondition": {"conditionTypeKey": "lap.button"},
+                    "endConditionValue": 0.0,
+                    "targetType": {"workoutTargetTypeKey": "no.target"},
+                },
+            ],
+        }],
+    }
+    errors = validation_errors(workout)
+    assert not errors, errors
+    sig = semantic_signature(workout)
+    assert sig["sport_type_key"] == "running", sig
+    assert len(sig["steps"]) == 3, sig
+    assert sig["steps"][1]["end_condition"] == "distance", sig
+    assert sig["steps"][1]["end_value"] == 5000.0, sig
+
+
 def main() -> int:
     tests = [
         test_shifted_run_matches,
@@ -196,6 +263,8 @@ def main() -> int:
         test_preview_gets_focus_and_plan_name,
         test_double_session_names_are_unique,
         test_named_clone_sanitizes_without_mutating_master,
+        test_in_progress_badge_shape_is_detected,
+        test_workout_lab_accepts_running_structure,
     ]
     print("=== GARMIN LOCAL COACH SELF-TEST ===")
     for test in tests:
