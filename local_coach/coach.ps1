@@ -61,9 +61,11 @@ function Ensure-Templates([switch]$Force) {
 
 function Build-CoachOutput {
     Run-CoachScript 'coach_brief_v2.py' -Required
-    Run-CoachScript 'coach_preview_v2.py' -Required
+    # One compact Ollama pass makes the actual adaptive 7-day plan.
+    Run-CoachScript 'coach_preview_fast.py' -Required
     Run-CoachScript 'preview_integrity.py' -Required
-    Run-CoachScript 'coach_voice.py' -Required
+    # Dashboard wording is deterministic; direct chat handles free-form conversation.
+    Run-CoachScript 'coach_voice_fast.py' -Required
     Run-CoachScript 'coach_dashboard.py' -Required
 }
 
@@ -163,3 +165,8 @@ finally {
     }
     $mutex.Dispose()
 }
+
+# Optional read-only collectors may have returned non-zero earlier in a successful
+# run. Normalize a genuinely completed pipeline to exit code 0 so the UI does not
+# show a false "Fejl (kode 1)" banner.
+exit 0
