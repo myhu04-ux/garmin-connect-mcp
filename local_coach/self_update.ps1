@@ -43,6 +43,39 @@ function Fail-And-Rollback([string]$Message, [string]$OldSha) {
     throw $Message
 }
 
+function Invoke-CoachTests([string]$OldSha) {
+    $coachDir = Join-Path $repo 'local_coach'
+    foreach ($file in Get-ChildItem -Path $coachDir -Filter '*.py' -File) {
+        & $python -m py_compile $file.FullName
+        if ($LASTEXITCODE -ne 0) {
+            if ($OldSha) { Fail-And-Rollback "Python-syntaksfejl i $($file.Name); rullet tilbage." $OldSha }
+            throw "Python-syntaksfejl i $($file.Name)."
+        }
+    }
+
+    $tests = @(
+        'garmin_capability_self_test.py',
+        'self_test.py',
+        'intent_self_test.py',
+        'router_self_test.py',
+        'calendar_writer_self_test.py',
+        'shadow_week_self_test.py',
+        'coach_benchmark_self_test.py'
+    )
+    foreach ($name in $tests) {
+        $path = Join-Path $coachDir $name
+        if (-not (Test-Path $path)) {
+            if ($OldSha) { Fail-And-Rollback "$name mangler; rullet tilbage." $OldSha }
+            throw "$name mangler."
+        }
+        & $python $path
+        if ($LASTEXITCODE -ne 0) {
+            if ($OldSha) { Fail-And-Rollback "$name fejlede; ny version blev rullet tilbage." $OldSha }
+            throw "$name fejlede."
+        }
+    }
+}
+
 if ($StartupCheck) { Start-Sleep -Seconds 8 }
 
 if (-not $git) { Save-Status 'failed' 'git.exe blev ikke fundet.'; throw 'git.exe blev ikke fundet.' }
@@ -62,47 +95,24 @@ if ($LASTEXITCODE -ne 0) { Save-Status 'failed' 'Git fetch fejlede.' $oldSha '';
 $remoteSha = (& $git -C $repo rev-parse "origin/$branch").Trim()
 
 if ($remoteSha -eq $oldSha) {
-    # Dependencies can still need reconciliation after a dependency-pin change.
     & $python -m pip install --upgrade -e $repo | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Afhængigheder kunne ikke synkroniseres.' }
-    $cap = Join-Path $repo 'local_coach\garmin_capability_self_test.py'
-    if (Test-Path $cap) {
-        & $python $cap
-        if ($LASTEXITCODE -ne 0) { throw 'Garmin-klientens native kapabiliteter mangler.' }
-    }
-    Save-Status 'current' 'Coachen og afhængighederne er opdaterede.' $oldSha $remoteSha
+    Invoke-CoachTests ''
+    Save-Status 'current' 'Coachen, afhængighederne og benchmark-tests er opdaterede.' $oldSha $remoteSha
     exit 0
 }
 
 & $git -C $repo pull --ff-only origin $branch
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Git pull fejlede; gammel version er bevaret.' $oldSha }
 $newSha = (& $git -C $repo rev-parse HEAD).Trim()
-Save-Status 'testing' 'Ny version hentet. Opgraderer fastlåste afhængigheder og kører tests.' $oldSha $newSha
+Save-Status 'testing' 'Ny version hentet. Opgraderer fastlåste afhængigheder og kører sikkerheds- og coach-benchmark-tests.' $oldSha $newSha
 
 & $python -m pip install --upgrade -e $repo | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail-And-Rollback 'Afhængigheder kunne ikke opdateres; rullet tilbage.' $oldSha }
 
-$coachDir = Join-Path $repo 'local_coach'
-foreach ($file in Get-ChildItem -Path $coachDir -Filter '*.py' -File) {
-    & $python -m py_compile $file.FullName
-    if ($LASTEXITCODE -ne 0) { Fail-And-Rollback "Python-syntaksfejl i $($file.Name); rullet tilbage." $oldSha }
-}
+Invoke-CoachTests $oldSha
 
-$tests = @(
-    'garmin_capability_self_test.py',
-    'self_test.py',
-    'intent_self_test.py',
-    'router_self_test.py',
-    'calendar_writer_self_test.py'
-)
-foreach ($name in $tests) {
-    $path = Join-Path $coachDir $name
-    if (-not (Test-Path $path)) { Fail-And-Rollback "$name mangler; rullet tilbage." $oldSha }
-    & $python $path
-    if ($LASTEXITCODE -ne 0) { Fail-And-Rollback "$name fejlede; ny version blev rullet tilbage." $oldSha }
-}
-
-Save-Status 'restarting' 'Tests bestået. Genstarter dashboard og coach-chat.' $oldSha $newSha
+Save-Status 'restarting' 'Alle tests bestået. Genstarter dashboard og coach-chat.' $oldSha $newSha
 try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_agent.py*') } |
@@ -132,6 +142,6 @@ if (-not $dashboardReady -or -not $chatReady) {
     exit 3
 }
 
-Save-Status 'updated' 'Coachen er opdateret, testet og genstartet.' $oldSha $newSha
+Save-Status 'updated' 'Coachen er opdateret, benchmark-testet og genstartet. Ekspertmodellen klargøres i baggrunden.' $oldSha $newSha
 if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:8766/' }
 exit 0
