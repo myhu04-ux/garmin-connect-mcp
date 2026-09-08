@@ -16,11 +16,12 @@ $capabilityTest = Join-Path $repo 'local_coach\garmin_capability_self_test.py'
 $calendarWriterTest = Join-Path $repo 'local_coach\calendar_writer_self_test.py'
 $shadowWeekTest = Join-Path $repo 'local_coach\shadow_week_self_test.py'
 $coachBenchmarkTest = Join-Path $repo 'local_coach\coach_benchmark_self_test.py'
+$compilerTest = Join-Path $repo 'local_coach\planned_workout_compiler_self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
 
-foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$intentTest,$routerTest,$capabilityTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest)) {
+foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$intentTest,$routerTest,$capabilityTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest,$compilerTest)) {
     if (-not (Test-Path $required)) { throw "Mangler fil: $required" }
 }
 
@@ -47,8 +48,8 @@ foreach ($psFile in @($coach, $automation, $selfUpdate)) {
 }
 Write-Host "Syntaks OK: $($pythonFiles.Count) Python-filer + centrale PowerShell-filer." -ForegroundColor Green
 
-Write-Host "`n3/6 Kører offline sikkerheds-, sprog- og coach-benchmark-tests..." -ForegroundColor Cyan
-foreach ($test in @($selfTest,$intentTest,$routerTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest)) {
+Write-Host "`n3/6 Kører offline sikkerheds-, sprog-, workout- og coach-benchmark-tests..." -ForegroundColor Cyan
+foreach ($test in @($selfTest,$intentTest,$routerTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest,$compilerTest)) {
     & $python $test
     if ($LASTEXITCODE -ne 0) { throw "Self-test fejlede: $test" }
 }
@@ -98,6 +99,6 @@ Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
 Write-Host "Fremtidige kodeopdateringer: skriv 'opdater dig selv' til coach-chatten."
-Write-Host 'Ekspertmodellen til ugeplaner klargøres automatisk i baggrunden.'
+Write-Host 'Ekspertmodellen til analyse og ugeplaner klargøres automatisk i baggrunden.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
 Write-Host 'Automatisk kalender-writeback er fortsat låst.' -ForegroundColor Yellow
