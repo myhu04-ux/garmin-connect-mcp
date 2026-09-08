@@ -1,16 +1,17 @@
 """Tool-aware local coach chat entrypoint.
 
-The athlete speaks ordinary Danish. The agent owns four constrained tool families:
-Garmin discovery, challenge/workout tools from coach_chat_fast, explicit CoachTest
-workout mutations, and explicit CoachTest calendar placement. Workout create/update
-gets one automatic self-heal retry using the athlete's approved Garmin master shape
-before an error is surfaced.
+The athlete speaks ordinary Danish. The agent owns constrained Garmin tools for
+workout create/update/delete, calendar placement, Garmin discovery and explicit
+enable/disable of adaptive calendar write-back. Workout create/update gets one
+automatic self-heal retry using the athlete's approved Garmin master shape before an
+error is surfaced.
 """
 
 from __future__ import annotations
 
 import threading
 
+import auto_calendar_control
 import coach_chat_fast as fast
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
@@ -74,6 +75,10 @@ def workout_mutation(message: str, operation: str) -> str:
 
 
 def answer(message: str) -> str:
+    automation = auto_calendar_control.handle(message)
+    if automation is not None:
+        return automation
+
     intent = training_intent.deterministic(message)
     operation = str(intent.get("operation") or "")
 
