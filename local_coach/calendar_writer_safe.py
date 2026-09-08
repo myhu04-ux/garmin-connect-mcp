@@ -4,7 +4,9 @@ Adds guards around the core writer:
 1) every read-back covers the full 7-day horizon, including month boundaries;
 2) schedule/move is transactional and waits for Garmin read-back convergence;
 3) final action verification retries because Garmin calendar reads can be stale;
-4) only during explicit --test-one, if the adaptive plan has no ADD/ADJUST/MOVE,
+4) expert ADD/ADJUST actions may resolve to a verified coach-generated structured
+   workout; strength still uses the approved master copy;
+5) only during explicit --test-one, if the adaptive plan has no ADD/ADJUST/MOVE,
    one FUTURE KEEP may be replaced by a same-content named copy. Normal automatic
    apply never synthesizes changes.
 """
@@ -17,6 +19,7 @@ from typing import Any
 
 import calendar_consistency
 import calendar_writer as base
+import planned_workout_compiler
 from calendar_probe import extract_items
 
 _ORIGINAL_ACTIONABLE = base.actionable
@@ -107,8 +110,6 @@ def transactional_schedule_then_unschedule(
                 attempts=8,
             )
             if not ok:
-                # Roll back only a placement created by this transaction. Never remove
-                # a placement that pre-existed before the action.
                 if created_new and isinstance(new_entry, dict) and new_entry.get("scheduled_workout_id"):
                     try:
                         api.unschedule_workout(new_entry["scheduled_workout_id"])
@@ -197,6 +198,10 @@ base.fresh_calendar = full_window_calendar
 base.schedule_then_unschedule = transactional_schedule_then_unschedule
 base.verify_action = verify_with_retry
 base.actionable = actionable_with_safe_test_fallback
+# Expert-generated running specs are compiled and read-back verified here. This
+# replacement preserves the old named-master path for strength and actions without
+# session_spec, and keeps MOVE semantics safe for coach-owned generated workouts.
+base.resolve_target_workout = planned_workout_compiler.resolve_for_action
 
 if __name__ == "__main__":
     raise SystemExit(base.main())
