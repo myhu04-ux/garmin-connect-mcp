@@ -9,27 +9,35 @@ $ui = Join-Path $repo 'local_coach\coach_ui.py'
 $chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
 $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfUpdate = Join-Path $repo 'local_coach\self_update.ps1'
-$selfTest = Join-Path $repo 'local_coach\self_test.py'
-$intentTest = Join-Path $repo 'local_coach\intent_self_test.py'
-$routerTest = Join-Path $repo 'local_coach\router_self_test.py'
-$capabilityTest = Join-Path $repo 'local_coach\garmin_capability_self_test.py'
-$calendarWriterTest = Join-Path $repo 'local_coach\calendar_writer_self_test.py'
-$shadowWeekTest = Join-Path $repo 'local_coach\shadow_week_self_test.py'
-$coachBenchmarkTest = Join-Path $repo 'local_coach\coach_benchmark_self_test.py'
-$compilerTest = Join-Path $repo 'local_coach\planned_workout_compiler_self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
+
+$testNames = @(
+    'garmin_capability_self_test.py',
+    'self_test.py',
+    'intent_self_test.py',
+    'router_self_test.py',
+    'calendar_writer_self_test.py',
+    'shadow_week_self_test.py',
+    'coach_benchmark_self_test.py',
+    'coach_routing_self_test.py',
+    'core_evidence_self_test.py',
+    'planned_workout_compiler_self_test.py',
+    'writeback_transaction_self_test.py'
+)
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
 
-foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$intentTest,$routerTest,$capabilityTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest,$compilerTest)) {
+foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$automation)) {
     if (-not (Test-Path $required)) { throw "Mangler fil: $required" }
 }
+foreach ($name in $testNames) {
+    $required = Join-Path $coachDir $name
+    if (-not (Test-Path $required)) { throw "Mangler testfil: $required" }
+}
 
-Write-Host "`n1/6 Installerer den fastlåste Garmin-klient og øvrige afhængigheder..." -ForegroundColor Cyan
+Write-Host "`n1/6 Installerer fastlåste afhængigheder..." -ForegroundColor Cyan
 & $python -m pip install --upgrade -e $repo
 if ($LASTEXITCODE -ne 0) { throw 'Python-afhængigheder kunne ikke installeres.' }
-& $python $capabilityTest
-if ($LASTEXITCODE -ne 0) { throw 'Den installerede Garmin-klient har ikke de native workout/kalender-metoder coachen kræver.' }
 
 Write-Host "`n2/6 Kontrollerer syntaks i hele coach-appen..." -ForegroundColor Cyan
 $pythonFiles = Get-ChildItem -Path $coachDir -Filter '*.py' -File
@@ -48,10 +56,11 @@ foreach ($psFile in @($coach, $automation, $selfUpdate)) {
 }
 Write-Host "Syntaks OK: $($pythonFiles.Count) Python-filer + centrale PowerShell-filer." -ForegroundColor Green
 
-Write-Host "`n3/6 Kører offline sikkerheds-, sprog-, workout- og coach-benchmark-tests..." -ForegroundColor Cyan
-foreach ($test in @($selfTest,$intentTest,$routerTest,$calendarWriterTest,$shadowWeekTest,$coachBenchmarkTest,$compilerTest)) {
+Write-Host "`n3/6 Kører den samme samlede regressionssuite som selvopdatering/CI..." -ForegroundColor Cyan
+foreach ($name in $testNames) {
+    $test = Join-Path $coachDir $name
     & $python $test
-    if ($LASTEXITCODE -ne 0) { throw "Self-test fejlede: $test" }
+    if ($LASTEXITCODE -ne 0) { throw "Self-test fejlede: $name" }
 }
 
 Write-Host "`n4/6 Installerer automatisk coach, dashboard, direkte chat og selvopdatering..." -ForegroundColor Cyan
@@ -99,6 +108,6 @@ Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
 Write-Host "Fremtidige kodeopdateringer: skriv 'opdater dig selv' til coach-chatten."
-Write-Host 'Ekspertmodellen til analyse og ugeplaner klargøres automatisk i baggrunden.'
+Write-Host '4B samtalemodel og 8B ekspertmodel klargøres automatisk i baggrunden.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
 Write-Host 'Automatisk kalender-writeback er fortsat låst.' -ForegroundColor Yellow
