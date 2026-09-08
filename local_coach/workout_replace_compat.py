@@ -5,8 +5,9 @@ replace the active CoachTest workout transactionally:
 1) upload and verify the new workout,
 2) mirror any existing calendar placements to the new workout and verify them,
 3) remove the old calendar placements,
-4) switch local state to the new workout,
-5) delete the old workout last.
+4) wait for Garmin calendar read-back to converge,
+5) switch local state to the new workout,
+6) delete the old workout last.
 
 If any step before state switch fails, the newly created workout/calendar placements
 are rolled back and the old workout remains authoritative.
@@ -17,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any
 
+import calendar_consistency
 from calendar_probe import extract_items
 
 import garmin_workout_workspace as workspace
@@ -71,6 +73,22 @@ def _find_new_entry(api: Any, workout_id: Any, date: str) -> dict[str, Any] | No
     return None
 
 
+def _wait_new_entry(api: Any, workout_id: Any, date: str) -> dict[str, Any] | None:
+    ok, row = calendar_consistency.wait_present(
+        lambda: _find_new_entry(api, workout_id, date),
+        attempts=8,
+    )
+    return row if ok and isinstance(row, dict) else None
+
+
+def _wait_no_old_rows(api: Any, workout_id: Any, preferred_date: str | None) -> bool:
+    ok, _ = calendar_consistency.wait_absent(
+        lambda: _calendar_rows_for_workout(api, workout_id, preferred_date),
+        attempts=8,
+    )
+    return ok
+
+
 def _rollback_new(api: Any, new_workout_id: Any, scheduled_ids: list[Any]) -> None:
     for sid in scheduled_ids:
         if not sid:
@@ -79,6 +97,15 @@ def _rollback_new(api: Any, new_workout_id: Any, scheduled_ids: list[Any]) -> No
             api.unschedule_workout(sid)
         except Exception:
             pass
+    try:
+        # Give Garmin a short opportunity to remove any newly scheduled rows before
+        # deleting the new template. Failure here is cleanup-only; old state remains.
+        calendar_consistency.wait_absent(
+            lambda: _calendar_rows_for_workout(api, new_workout_id),
+            attempts=4,
+        )
+    except Exception:
+        pass
     try:
         api.delete_workout(new_workout_id)
     except Exception:
@@ -110,7 +137,8 @@ def replace_update(intent: dict[str, Any]) -> dict[str, Any]:
         _rollback_new(api, new_workout_id, [])
         raise RuntimeError("Erstatnings-workoutet blev ikke semantisk verificeret: " + detail)
 
-    old_rows = _calendar_rows_for_workout(api, old_workout_id, str(current.get("scheduled_date") or ""))
+    preferred_date = str(current.get("scheduled_date") or "")
+    old_rows = _calendar_rows_for_workout(api, old_workout_id, preferred_date)
     new_scheduled_ids: list[Any] = []
     new_entries: list[dict[str, Any]] = []
 
@@ -121,9 +149,9 @@ def replace_update(intent: dict[str, Any]) -> dict[str, Any]:
             if not date:
                 continue
             api.schedule_workout(new_workout_id, date)
-            new_entry = _find_new_entry(api, new_workout_id, date)
+            new_entry = _wait_new_entry(api, new_workout_id, date)
             if not new_entry:
-                raise RuntimeError(f"Det nye workout kunne ikke læses tilbage i kalenderen på {date}.")
+                raise RuntimeError(f"Det nye workout kunne ikke læses tilbage i kalenderen på {date} efter gentagne forsøg.")
             new_entries.append(new_entry)
             if new_entry.get("scheduled_workout_id"):
                 new_scheduled_ids.append(new_entry.get("scheduled_workout_id"))
@@ -131,7 +159,8 @@ def replace_update(intent: dict[str, Any]) -> dict[str, Any]:
         _rollback_new(api, new_workout_id, new_scheduled_ids)
         raise
 
-    # Only now remove the old calendar placements. Roll back the new ones if removal fails.
+    # Only now remove old placements. Garmin may be eventually consistent, so wait
+    # for the old rows to disappear before deciding whether the transaction failed.
     try:
         for old_row in old_rows:
             sid = old_row.get("scheduled_workout_id")
@@ -141,11 +170,11 @@ def replace_update(intent: dict[str, Any]) -> dict[str, Any]:
         _rollback_new(api, new_workout_id, new_scheduled_ids)
         raise RuntimeError(f"Nyt workout var verificeret, men gammel kalenderplacering kunne ikke fjernes; alt nyt blev rullet tilbage: {exc}") from exc
 
-    # Verify old workout no longer has placements in the scanned horizon.
-    remaining_old = _calendar_rows_for_workout(api, old_workout_id, str(current.get("scheduled_date") or ""))
-    if remaining_old:
+    if old_rows and not _wait_no_old_rows(api, old_workout_id, preferred_date):
         _rollback_new(api, new_workout_id, new_scheduled_ids)
-        raise RuntimeError("Garmin viser stadig en gammel kalenderplacering efter flytning; den nye version blev rullet tilbage.")
+        raise RuntimeError(
+            "Garmin viser stadig en gammel kalenderplacering efter flere read-back-forsøg; den nye version blev rullet tilbage."
+        )
 
     current.update({
         "workout_id": new_workout_id,
@@ -160,15 +189,18 @@ def replace_update(intent: dict[str, Any]) -> dict[str, Any]:
     if len(new_entries) == 1:
         current["scheduled_date"] = str(new_entries[0].get("date") or "")[:10]
         current["scheduled_workout_id"] = new_entries[0].get("scheduled_workout_id")
+        current.pop("scheduled_instances", None)
     elif not new_entries:
         current.pop("scheduled_date", None)
         current.pop("scheduled_workout_id", None)
+        current.pop("scheduled_instances", None)
     else:
         current["scheduled_instances"] = [
             {"date": str(x.get("date") or "")[:10], "scheduled_workout_id": x.get("scheduled_workout_id")}
             for x in new_entries
         ]
 
+    current["calendar_verified_at"] = dt.datetime.now().astimezone().isoformat()
     workspace.save(workspace.STATE, current)
 
     cleanup_warning = None
