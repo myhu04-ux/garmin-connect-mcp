@@ -1,8 +1,8 @@
 """Tool-aware local coach chat entrypoint.
 
 The athlete speaks ordinary Danish. Known Garmin actions are routed deterministically
-before the LLM, including inflected Danish wording and compound requests. Qwen is only
-used for genuine coaching conversation, never to improvise a known Garmin mutation.
+before the LLM. Garmin mutations use the native APIs required by garminconnect 0.3.12;
+legacy replacement fallbacks are deliberately not used.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import test_workout_calendar
 import training_intent
-import workout_replace_compat
 import workout_selfheal
 
 
@@ -63,8 +62,8 @@ def start_self_update() -> str:
         return f"Jeg kunne ikke starte selvopdateringen: {exc}"
     return (
         "Jeg starter selvopdateringen nu. Jeg henter kun fra coachens faste GitHub-branch, "
-        "kører syntaks- og sikkerhedstests og genstarter kun den nye version, hvis de består. "
-        "Chatten kan forsvinde kortvarigt, mens jeg genstarter."
+        "opgraderer de fastlåste afhængigheder, kører tests og genstarter kun, hvis de består. "
+        "Chatten kan forsvinde kortvarigt."
     )
 
 
@@ -90,7 +89,7 @@ def catalog_answer(message: str) -> str:
     if not matches:
         return (
             "Jeg har gennemsøgt den installerede Garmin-klients read-only get_* metoder, "
-            "men fandt ingen tydelig kandidat til det, du beskrev. Jeg vil ikke gætte på et endpoint."
+            "men fandt ingen tydelig kandidat. Jeg vil ikke gætte på et endpoint."
         )
 
     lines = ["Jeg har søgt i den Garmin-klient, der faktisk er installeret. Mest relevante read-only kandidater:"]
@@ -98,20 +97,7 @@ def catalog_answer(message: str) -> str:
         sig = row.get("signature") or ""
         doc = row.get("doc") or ""
         lines.append(f"• {row.get('method')}{sig}" + (f" – {doc}" if doc else ""))
-    lines.append(
-        "Det her er kun discovery. Et nyt endpoint bliver først koblet på som et eksplicit read-only værktøj, "
-        "så coachen ikke eksperimenterer blindt mod din Garmin-konto."
-    )
     return "\n".join(lines)
-
-
-def compatibility_update(message: str, parsed_intent: dict | None = None) -> str:
-    """Update the active test workout without assuming update_workout exists.
-
-    This path is itself the update self-heal. It must not call the older in-place
-    master self-heal, because that can depend on the exact method that is missing.
-    """
-    return workout_replace_compat.recover_message(message, parsed_intent)
 
 
 def workout_mutation(message: str, operation: str) -> str:
@@ -121,45 +107,31 @@ def workout_mutation(message: str, operation: str) -> str:
             if isinstance(state, dict) and (state.get("scheduled_workout_id") or state.get("scheduled_date")):
                 test_workout_calendar.unschedule()
         except Exception as exc:
-            return f"Jeg sletter ikke workoutet, fordi jeg først skulle fjerne det sikkert fra kalenderen, og det fejlede: {exc}"
+            return f"Jeg sletter ikke workoutet, fordi kalenderplaceringen først skulle fjernes sikkert: {exc}"
 
     try:
         result = garmin_workout_workspace.handle(message)
         return result or "Workout-handlingen blev gennemført."
     except Exception as first_error:
-        if operation == "update_test_workout":
-            try:
-                return compatibility_update(message)
-            except Exception as second_error:
-                return (
-                    "Jeg kunne ikke gennemføre ændringen, selv efter automatisk kompatibilitets-self-heal. "
-                    f"Første fejl: {first_error}. Self-heal: {second_error}"
-                )
         if operation == "create_test_workout":
             try:
                 return workout_selfheal.recover(message)
             except Exception as second_error:
                 return (
-                    "Jeg prøvede først standardformatet og derefter automatisk Garmin-master-formatet. "
-                    f"Begge blev afvist, så jeg stoppede uden at fortsætte blindt. Første fejl: {first_error}. "
-                    f"Self-heal: {second_error}"
+                    "Jeg prøvede standardformatet og derefter din godkendte Garmin-master. "
+                    f"Begge blev afvist, så jeg stoppede. Første fejl: {first_error}. "
+                    f"Master-forsøg: {second_error}"
                 )
-        return f"Jeg forstod Garmin-handlingen, men gennemførte den ikke: {first_error}"
+        return f"Garmin-handlingen blev ikke gennemført: {first_error}"
 
 
-def apply_direct_update(message: str, parsed_intent: dict) -> str:
-    """Apply an already parsed test-workout edit without reparsing a compound sentence."""
+def apply_direct_update(parsed_intent: dict) -> str:
+    """Update the active test workout in place using Garmin's native PUT endpoint."""
     try:
         result = garmin_workout_workspace.update_test(parsed_intent)
         return garmin_workout_workspace.describe(result)
-    except Exception as first_error:
-        try:
-            return compatibility_update(message, parsed_intent)
-        except Exception as second_error:
-            return (
-                "Jeg forstod ændringen, men den kunne ikke gennemføres efter automatisk self-heal. "
-                f"Standardforsøg: {first_error}. Self-heal: {second_error}"
-            )
+    except Exception as exc:
+        return f"Jeg forstod ændringen, men Garmin kunne ikke gennemføre den sikkert: {exc}"
 
 
 def handle_action_bundle(message: str) -> str | None:
@@ -177,11 +149,11 @@ def handle_action_bundle(message: str) -> str | None:
 
     if bundle.get("update_requested"):
         if bundle.get("has_update_parameters"):
-            replies.append(apply_direct_update(message, bundle.get("parsed_intent") or {}))
+            replies.append(apply_direct_update(bundle.get("parsed_intent") or {}))
         else:
             replies.append(
-                "Jeg forstår, at testpasset skal være kortere/ændres, men du har ikke angivet hvor meget. "
-                "Jeg ændrer derfor ikke selve workoutet på gæt. Skriv fx 'gør den 10 minutter kortere'."
+                "Jeg forstår, at testpasset skal ændres, men mangler en konkret ændring. "
+                "Skriv fx 'gør den 10 minutter kortere'."
             )
 
     calendar_op = bundle.get("calendar_operation")
@@ -192,7 +164,7 @@ def handle_action_bundle(message: str) -> str | None:
         try:
             replies.append(test_workout_calendar.handle_intent(intent))
         except Exception as exc:
-            replies.append(f"Jeg forstod kalenderhandlingen, men gennemførte den ikke: {exc}")
+            replies.append(f"Jeg forstod kalenderhandlingen, men Garmin kunne ikke gennemføre den sikkert: {exc}")
 
     return "\n\n".join(x for x in replies if x) or None
 
@@ -219,7 +191,7 @@ def answer(message: str) -> str:
         try:
             return test_workout_calendar.handle_intent(intent)
         except Exception as exc:
-            return f"Jeg forstod kalenderhandlingen, men gennemførte den ikke: {exc}"
+            return f"Jeg forstod kalenderhandlingen, men Garmin kunne ikke gennemføre den sikkert: {exc}"
 
     if wants_catalog(message):
         return catalog_answer(message)
