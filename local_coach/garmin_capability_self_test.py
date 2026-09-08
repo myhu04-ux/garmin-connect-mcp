@@ -6,7 +6,7 @@ from importlib.metadata import version
 
 from garminconnect import Garmin
 
-REQUIRED_VERSION = "0.3.12"
+REQUIRED_VERSION = "0.3.11"
 REQUIRED_METHODS = (
     "get_workout_by_id",
     "upload_workout",
