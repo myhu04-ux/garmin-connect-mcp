@@ -1,0 +1,51 @@
+name: Local Coach CI
+
+on:
+  push:
+    branches:
+      - feature/local-training-coach
+  workflow_dispatch:
+
+jobs:
+  pure-python-regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install project
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Compile all local coach modules
+        shell: pwsh
+        run: |
+          Get-ChildItem local_coach -Filter *.py -File | ForEach-Object {
+            python -m py_compile $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Compile failed: $($_.Name)" }
+          }
+
+      - name: Run pure offline coach regressions
+        shell: pwsh
+        run: |
+          $tests = @(
+            'shadow_week_self_test.py',
+            'coach_benchmark_self_test.py',
+            'coach_routing_self_test.py',
+            'core_evidence_self_test.py',
+            'planned_workout_compiler_self_test.py',
+            'writeback_transaction_self_test.py'
+          )
+          foreach ($name in $tests) {
+            Write-Host "=== $name ==="
+            python (Join-Path 'local_coach' $name)
+            if ($LASTEXITCODE -ne 0) { throw "Test failed: $name" }
+          }
