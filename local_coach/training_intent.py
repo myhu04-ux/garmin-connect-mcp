@@ -1,14 +1,13 @@
 """Translate natural Danish coach requests into a small, validated training intent.
 
-The athlete should be able to describe the desired outcome in ordinary language.
-This module maps that language to a constrained schema. It does NOT write to Garmin.
-A deterministic parser handles common cases quickly; local Qwen is only used when
-needed to interpret freer wording. Python remains responsible for workout safety and
-Garmin formatting.
+The athlete speaks ordinary Danish. This module maps the request to a constrained
+schema used by the coach tools. It does NOT write to Garmin. Clear requests are
+handled deterministically and quickly; local Qwen is only used for freer wording.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 from typing import Any
@@ -22,6 +21,9 @@ OPERATIONS = {
     "create_test_workout",
     "update_test_workout",
     "delete_test_workout",
+    "schedule_test_workout",
+    "move_test_workout",
+    "unschedule_test_workout",
     "inspect_workout",
     "training_question",
 }
@@ -37,6 +39,18 @@ OBJECTIVES = {
 }
 SPORTS = {"running", "strength", "unknown"}
 
+WEEKDAYS = {
+    "mandag": 0,
+    "tirsdag": 1,
+    "onsdag": 2,
+    "torsdag": 3,
+    "fredag": 4,
+    "lørdag": 5,
+    "lordag": 5,
+    "søndag": 6,
+    "sondag": 6,
+}
+
 
 def _num(pattern: str, text: str) -> float | None:
     m = re.search(pattern, text, flags=re.I)
@@ -48,17 +62,79 @@ def _num(pattern: str, text: str) -> float | None:
         return None
 
 
+def parse_target_date(text: str, today: dt.date | None = None) -> str | None:
+    """Resolve common Danish date phrases to YYYY-MM-DD."""
+    today = today or dt.date.today()
+    lower = text.casefold()
+
+    if "i morgen" in lower:
+        return (today + dt.timedelta(days=1)).isoformat()
+    if "i dag" in lower:
+        return today.isoformat()
+
+    m = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", lower)
+    if m:
+        try:
+            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            pass
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b", lower)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            candidate = dt.date(year, month, day)
+            if not m.group(3) and candidate < today:
+                candidate = dt.date(year + 1, month, day)
+            return candidate.isoformat()
+        except ValueError:
+            pass
+
+    for name, weekday in WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", lower):
+            days = (weekday - today.weekday()) % 7
+            if days == 0:
+                days = 7
+            return (today + dt.timedelta(days=days)).isoformat()
+    return None
+
+
 def deterministic(message: str) -> dict[str, Any]:
     text = message.casefold().strip()
-    explicit_test = any(k in text for k in ("test-løb", "test løb", "testløb", "test-workout", "test workout", "testpas", "test-pas"))
-    refers_to_plan = any(k in text for k in ("planen", "ugen", "kalender", "næste uge", "hele planen"))
-    followup_delete = (not refers_to_plan) and any(k in text for k in ("slet den", "fjern den", "slet løbet", "fjern løbet", "delete den"))
+    explicit_test = any(k in text for k in (
+        "test-løb", "test løb", "testløb", "test-workout", "test workout", "testpas", "test-pas"
+    ))
+    target_date = parse_target_date(text)
+
+    calendar_remove = any(k in text for k in (
+        "fjern den fra kalender", "tag den ud af kalender", "slet den fra kalender",
+        "fjern løbet fra kalender", "unschedule"
+    ))
+    calendar_move = any(k in text for k in (
+        "flyt den", "flyt løbet", "flyt test", "ryk den", "ryk løbet"
+    )) and (target_date is not None or "kalender" in text)
+    calendar_add = any(k in text for k in (
+        "læg den i kalender", "læg løbet i kalender", "læg test", "planlæg den", "planlaeg den",
+        "sæt den i kalender", "saet den i kalender", "schedule"
+    ))
+
+    refers_to_plan = any(k in text for k in ("planen", "ugen", "næste uge", "hele planen"))
+    followup_delete = (not refers_to_plan) and any(k in text for k in (
+        "slet den", "fjern den", "slet løbet", "delete den"
+    ))
     followup_update = (not refers_to_plan) and any(k in text for k in (
         "juster den", "justér den", "juster løbet", "ændr den", "ændr løbet", "ret den",
         "gør den", "lav den om", "kort den", "forlæng den", "skift den", "skift til",
     ))
 
-    if (explicit_test and any(k in text for k in ("slet", "fjern", "delete"))) or followup_delete:
+    if calendar_remove:
+        operation = "unschedule_test_workout"
+    elif calendar_move:
+        operation = "move_test_workout"
+    elif calendar_add:
+        operation = "schedule_test_workout"
+    elif (explicit_test and any(k in text for k in ("slet", "fjern", "delete"))) or followup_delete:
         operation = "delete_test_workout"
     elif (explicit_test and any(k in text for k in ("juster", "justér", "ændr", "ret ", "gør den", "lav den om", "opdater"))) or followup_update:
         operation = "update_test_workout"
@@ -86,7 +162,9 @@ def deterministic(message: str) -> dict[str, Any]:
     else:
         objective = "general"
 
-    sport = "strength" if objective == "strength" else ("running" if operation != "training_question" or any(k in text for k in ("løb", "run", "vo2", "trail", "tempo")) else "unknown")
+    sport = "strength" if objective == "strength" else (
+        "running" if operation != "training_question" or any(k in text for k in ("løb", "run", "vo2", "trail", "tempo")) else "unknown"
+    )
 
     duration = _num(r"(?:i|på|samlet|maks|max|ca\.?|cirka)\s*(\d+(?:[\.,]\d+)?)\s*min", text)
     if duration is None:
@@ -112,6 +190,7 @@ def deterministic(message: str) -> dict[str, Any]:
         "warmup_min": warmup,
         "cooldown_min": cooldown,
         "relative_minutes": (-shorter if shorter is not None else longer),
+        "target_date": target_date,
         "original_message": message,
         "source": "deterministic",
     }
@@ -134,18 +213,19 @@ def _clean(candidate: Any, fallback: dict[str, Any]) -> dict[str, Any]:
     value = candidate.get("repetitions")
     if isinstance(value, int) and 1 <= value <= 30:
         out["repetitions"] = value
+    if isinstance(candidate.get("target_date"), str) and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", candidate["target_date"]):
+        out["target_date"] = candidate["target_date"]
     out["source"] = "qwen+deterministic"
     return out
 
 
 def interpret(message: str, use_model: bool = True) -> dict[str, Any]:
     base = deterministic(message)
-    # Clear action/objective requests do not need an LLM roundtrip.
-    if not use_model or (base["operation"] != "training_question" and base["objective"] != "general"):
+    if not use_model or base["operation"] != "training_question" or base["objective"] != "general":
         return base
 
     schema = {
-        "operation": "training_question|create_test_workout|update_test_workout|delete_test_workout|inspect_workout",
+        "operation": "training_question|create_test_workout|update_test_workout|delete_test_workout|schedule_test_workout|move_test_workout|unschedule_test_workout|inspect_workout",
         "sport": "running|strength|unknown",
         "objective": "vo2max|threshold|endurance|trail_specificity|recovery|strength|marathon_pace|general",
         "duration_min": None,
@@ -156,11 +236,12 @@ def interpret(message: str, use_model: bool = True) -> dict[str, Any]:
         "warmup_min": None,
         "cooldown_min": None,
         "relative_minutes": None,
+        "target_date": None,
     }
     prompt = (
         "Fortolk brugerens danske besked som træner-intent. Returner KUN ét JSON-objekt, ingen markdown. "
-        "Gæt ikke på tal, som brugeren ikke har angivet. 'Jeg vil forbedre VO2-maks' betyder objective=vo2max, "
-        "men er normalt training_question medmindre brugeren udtrykkeligt beder om at oprette/ændre et testpas. "
+        "Gæt ikke på tal eller datoer, som brugeren ikke har angivet. Samtale om et mål er training_question; "
+        "Garmin-write kræver at brugeren tydeligt beder om at oprette, ændre, slette eller kalenderplacere testpasset. "
         f"Tilladt schema: {json.dumps(schema, ensure_ascii=False)}\nBESKED={message[:1200]}"
     )
     try:
