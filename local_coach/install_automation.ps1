@@ -10,6 +10,7 @@ $root = 'C:\GarminCoach'
 $repo = Join-Path $root 'garmin-connect-mcp'
 $coach = Join-Path $repo 'local_coach\coach.ps1'
 $ui = Join-Path $repo 'local_coach\coach_ui.py'
+$chat = Join-Path $repo 'local_coach\coach_chat_ui.py'
 $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $taskName = 'Garmin Local Coach - Auto'
@@ -17,6 +18,7 @@ $startupDir = [Environment]::GetFolderPath('Startup')
 $uiLauncher = Join-Path $startupDir 'Garmin Local Coach UI.vbs'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $urlFile = Join-Path $desktop 'Garmin Local Coach.url'
+$chatUrlFile = Join-Path $desktop 'Tal med Garmin Coach.url'
 
 if (-not (Test-Path $coach)) { throw "Mangler coach.ps1: $coach" }
 if (-not (Test-Path $python)) { throw "Mangler Python-miljø: $python" }
@@ -31,9 +33,6 @@ if ($DisableCoach) {
     if ($selectedDays.Count -eq 0) { throw 'Vælg mindst én gyldig ugedag.' }
     $dayArg = $selectedDays -join ','
 
-    # schtasks is used because it works on standard Windows 10 without extra modules.
-    # The scheduled command runs hidden and the coach itself decides whether write-back
-    # is enabled. Until the one-workout test passes it remains analysis-only.
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $taskCommand = '"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" auto' -f $powershell, $coach
 
@@ -46,9 +45,11 @@ if ($InstallUiStartup) {
     $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
     $escapedPython = $uiPython.Replace('"','""')
     $escapedUi = $ui.Replace('"','""')
+    $escapedChat = $chat.Replace('"','""')
+    $chatLine = if (Test-Path $chat) { "`nshell.Run `"`"`"$escapedPython`"`" `"`"$escapedChat`"`"`", 0, False" } else { '' }
     $vbs = @"
 Set shell = CreateObject("WScript.Shell")
-shell.Run """$escapedPython"" ""$escapedUi"" --no-browser", 0, False
+shell.Run """$escapedPython"" ""$escapedUi"" --no-browser", 0, False$chatLine
 "@
     Set-Content -Path $uiLauncher -Value $vbs -Encoding ASCII
 
@@ -59,8 +60,20 @@ IconFile=%SystemRoot%\System32\shell32.dll
 IconIndex=14
 "@
     Set-Content -Path $urlFile -Value $url -Encoding ASCII
+
+    if (Test-Path $chat) {
+        $chatUrl = @"
+[InternetShortcut]
+URL=http://127.0.0.1:8766/
+IconFile=%SystemRoot%\System32\shell32.dll
+IconIndex=14
+"@
+        Set-Content -Path $chatUrlFile -Value $chatUrl -Encoding ASCII
+    }
+
     Write-Host "UI autostart: $uiLauncher"
-    Write-Host "Genvej på skrivebordet: $urlFile"
+    Write-Host "Dashboard-genvej: $urlFile"
+    if (Test-Path $chat) { Write-Host "Coach-chat-genvej: $chatUrlFile" }
 }
 
 Write-Host 'Automation setup complete.'
