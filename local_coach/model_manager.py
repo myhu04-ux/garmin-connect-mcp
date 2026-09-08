@@ -1,9 +1,9 @@
 """Manage the local Ollama models used by Garmin Coach.
 
-COACH_MODEL is the athlete-facing expert model for free-form coaching and planning.
-FAST_MODEL remains available only for tightly constrained internal parsing helpers.
-The expert model is downloaded in the background so the local web UI stays responsive.
-The curated evidence library is also seeded into training_knowledge at import time.
+PARSER_MODEL is internal only. CHAT_MODEL handles ordinary free-form conversation when
+no deterministic tool can answer. COACH_MODEL is reserved for deep synthesis, weekly
+planning, goal research and adaptive planning. Downloads are local/free and serialized
+so the Acer does not try to download two multi-GB models concurrently.
 """
 
 from __future__ import annotations
@@ -19,34 +19,51 @@ import requests
 import core_evidence
 
 OLLAMA_ROOT = "http://127.0.0.1:11434"
-FAST_MODEL = "qwen3:1.7b"
+PARSER_MODEL = "qwen3:1.7b"
+FAST_MODEL = PARSER_MODEL  # backwards-compatible name for constrained parser modules
+CHAT_MODEL = "qwen3:4b"
 COACH_MODEL = "qwen3:8b"
 STATUS = Path(r"C:\GarminCoach\data\model_status.json")
-_LOCK = threading.Lock()
-_PULL_THREAD: threading.Thread | None = None
+_THREADS: dict[str, threading.Thread] = {}
+_THREADS_LOCK = threading.Lock()
+_DOWNLOAD_LOCK = threading.Lock()
 
-# Evidence seeding must never make model import fail; write problems are surfaced by
-# normal coach diagnostics later. Existing user-researched plan references are kept.
 try:
     core_evidence.seed_training_knowledge()
 except Exception:
     pass
 
 
-def _save(payload: dict[str, Any]) -> None:
-    STATUS.parent.mkdir(parents=True, exist_ok=True)
-    data = dict(payload)
-    data["updated_at"] = dt.datetime.now().astimezone().isoformat()
-    STATUS.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def status() -> dict[str, Any]:
+def _load_status() -> dict[str, Any]:
     if not STATUS.exists():
-        return {"state": "unknown", "model": COACH_MODEL}
+        return {"models": {}}
     try:
-        return json.loads(STATUS.read_text(encoding="utf-8"))
+        value = json.loads(STATUS.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {"models": {}}
     except Exception:
-        return {"state": "unknown", "model": COACH_MODEL}
+        return {"models": {}}
+
+
+def _save_model(model: str, payload: dict[str, Any]) -> None:
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    current = _load_status()
+    models = current.get("models") if isinstance(current.get("models"), dict) else {}
+    row = dict(payload)
+    row["model"] = model
+    row["updated_at"] = dt.datetime.now().astimezone().isoformat()
+    models[model] = row
+    current["models"] = models
+    current["updated_at"] = row["updated_at"]
+    STATUS.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def status(model: str | None = None) -> dict[str, Any]:
+    payload = _load_status()
+    if model is None:
+        return payload
+    models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
+    row = models.get(model)
+    return row if isinstance(row, dict) else {"state": "unknown", "model": model}
 
 
 def installed_models(timeout: float = 4.0) -> set[str]:
@@ -66,7 +83,7 @@ def installed_models(timeout: float = 4.0) -> set[str]:
     return names
 
 
-def is_installed(model: str = COACH_MODEL) -> bool:
+def is_installed(model: str) -> bool:
     try:
         names = installed_models()
     except Exception:
@@ -74,75 +91,100 @@ def is_installed(model: str = COACH_MODEL) -> bool:
     return model in names or f"{model}:latest" in names
 
 
-def pull_model(model: str = COACH_MODEL) -> None:
-    _save({"state": "checking", "model": model, "progress_pct": 0})
+def pull_model(model: str) -> None:
+    # Ollama can technically handle concurrent pulls, but serial downloads are kinder
+    # to this older laptop and make progress/error states much easier to reason about.
+    with _DOWNLOAD_LOCK:
+        _save_model(model, {"state": "checking", "progress_pct": 0})
+        try:
+            if is_installed(model):
+                _save_model(model, {"state": "ready", "progress_pct": 100})
+                return
+            _save_model(model, {"state": "downloading", "progress_pct": 0})
+            with requests.post(
+                f"{OLLAMA_ROOT}/api/pull",
+                json={"model": model, "stream": True},
+                stream=True,
+                timeout=(10, 60 * 60),
+            ) as response:
+                response.raise_for_status()
+                last_pct = 0
+                last_status = "downloading"
+                for raw in response.iter_lines():
+                    if not raw:
+                        continue
+                    try:
+                        row = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        continue
+                    last_status = str(row.get("status") or last_status)
+                    total = row.get("total")
+                    completed = row.get("completed")
+                    if total and completed is not None:
+                        try:
+                            last_pct = max(0, min(100, int(100 * float(completed) / float(total))))
+                        except Exception:
+                            pass
+                    _save_model(model, {
+                        "state": "downloading",
+                        "progress_pct": last_pct,
+                        "detail": last_status,
+                    })
+            if not is_installed(model):
+                raise RuntimeError("Ollama afsluttede download, men modellen kan ikke findes i /api/tags.")
+            _save_model(model, {"state": "ready", "progress_pct": 100})
+        except Exception as exc:
+            _save_model(model, {"state": "error", "error": str(exc)[:500]})
+
+
+def ensure_model_background(model: str) -> dict[str, Any]:
     try:
         if is_installed(model):
-            _save({"state": "ready", "model": model, "progress_pct": 100})
-            return
-        _save({"state": "downloading", "model": model, "progress_pct": 0})
-        with requests.post(
-            f"{OLLAMA_ROOT}/api/pull",
-            json={"model": model, "stream": True},
-            stream=True,
-            timeout=(10, 60 * 45),
-        ) as response:
-            response.raise_for_status()
-            last_pct = 0
-            last_status = "downloading"
-            for raw in response.iter_lines():
-                if not raw:
-                    continue
-                try:
-                    row = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    continue
-                last_status = str(row.get("status") or last_status)
-                total = row.get("total")
-                completed = row.get("completed")
-                if total and completed is not None:
-                    try:
-                        last_pct = max(0, min(100, int(100 * float(completed) / float(total))))
-                    except Exception:
-                        pass
-                _save({
-                    "state": "downloading",
-                    "model": model,
-                    "progress_pct": last_pct,
-                    "detail": last_status,
-                })
-        if not is_installed(model):
-            raise RuntimeError("Ollama afsluttede download, men modellen kan ikke findes i /api/tags.")
-        _save({"state": "ready", "model": model, "progress_pct": 100})
-    except Exception as exc:
-        _save({"state": "error", "model": model, "error": str(exc)[:500]})
-
-
-def ensure_coach_model_background() -> dict[str, Any]:
-    global _PULL_THREAD
-    try:
-        if is_installed(COACH_MODEL):
-            _save({"state": "ready", "model": COACH_MODEL, "progress_pct": 100})
-            return status()
+            _save_model(model, {"state": "ready", "progress_pct": 100})
+            return status(model)
     except Exception:
         pass
-    with _LOCK:
-        if _PULL_THREAD is None or not _PULL_THREAD.is_alive():
-            _PULL_THREAD = threading.Thread(target=pull_model, args=(COACH_MODEL,), daemon=True)
-            _PULL_THREAD.start()
-    return status()
+    with _THREADS_LOCK:
+        thread = _THREADS.get(model)
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=pull_model, args=(model,), daemon=True)
+            _THREADS[model] = thread
+            thread.start()
+    return status(model)
 
 
-def coach_model_ready() -> tuple[bool, str]:
-    if is_installed(COACH_MODEL):
-        current = status()
+def _ready(model: str, label: str) -> tuple[bool, str]:
+    if is_installed(model):
+        current = status(model)
         if current.get("state") != "ready":
-            _save({"state": "ready", "model": COACH_MODEL, "progress_pct": 100})
-        return True, COACH_MODEL
-    current = ensure_coach_model_background()
+            _save_model(model, {"state": "ready", "progress_pct": 100})
+        return True, model
+    current = ensure_model_background(model)
     state = current.get("state") or "downloading"
     pct = current.get("progress_pct")
     if state == "error":
-        return False, f"Den større coach-model kunne ikke installeres: {current.get('error') or 'ukendt fejl'}"
+        return False, f"{label} kunne ikke installeres: {current.get('error') or 'ukendt fejl'}"
     suffix = f" ({pct}%)" if pct is not None else ""
-    return False, f"Den større coach-model {COACH_MODEL} installeres lokalt{suffix}. Prøv igen, når den er klar."
+    return False, f"{label} {model} installeres lokalt{suffix}. Prøv igen, når den er klar."
+
+
+def chat_model_ready() -> tuple[bool, str]:
+    return _ready(CHAT_MODEL, "Samtalemodellen")
+
+
+def coach_model_ready() -> tuple[bool, str]:
+    return _ready(COACH_MODEL, "Ekspertmodellen")
+
+
+def ensure_chat_model_background() -> dict[str, Any]:
+    return ensure_model_background(CHAT_MODEL)
+
+
+def ensure_coach_model_background() -> dict[str, Any]:
+    return ensure_model_background(COACH_MODEL)
+
+
+def ensure_all_models_background() -> None:
+    # Start the chat model first so ordinary conversation becomes useful sooner.
+    ensure_chat_model_background()
+    ensure_coach_model_background()
