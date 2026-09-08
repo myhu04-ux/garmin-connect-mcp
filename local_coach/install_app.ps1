@@ -4,33 +4,29 @@ $root = 'C:\GarminCoach'
 $repo = Join-Path $root 'garmin-connect-mcp'
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $pythonw = Join-Path $root '.venv\Scripts\pythonw.exe'
-$coach = Join-Path $repo 'local_coach\coach.ps1'
-$ui = Join-Path $repo 'local_coach\coach_ui.py'
-$chat = Join-Path $repo 'local_coach\coach_chat_agent.py'
-$automation = Join-Path $repo 'local_coach\install_automation.ps1'
-$selfUpdate = Join-Path $repo 'local_coach\self_update.ps1'
 $coachDir = Join-Path $repo 'local_coach'
+$coach = Join-Path $coachDir 'coach.ps1'
+$ui = Join-Path $coachDir 'coach_ui.py'
+$chat = Join-Path $coachDir 'coach_chat_agent.py'
+$automation = Join-Path $coachDir 'install_automation.ps1'
+$selfUpdate = Join-Path $coachDir 'self_update.ps1'
+$testManifest = Join-Path $coachDir 'regression_tests.txt'
 
-$testNames = @(
-    'garmin_capability_self_test.py',
-    'self_test.py',
-    'intent_self_test.py',
-    'router_self_test.py',
-    'calendar_writer_self_test.py',
-    'shadow_week_self_test.py',
-    'coach_benchmark_self_test.py',
-    'coach_routing_self_test.py',
-    'core_evidence_self_test.py',
-    'planned_workout_compiler_self_test.py',
-    'writeback_transaction_self_test.py'
-)
+function Regression-TestNames {
+    if (-not (Test-Path $testManifest)) { throw "Regressionstest-manifest mangler: $testManifest" }
+    return @(
+        Get-Content -Path $testManifest |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith('#') }
+    )
+}
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
 
-foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$automation)) {
+foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$automation,$testManifest)) {
     if (-not (Test-Path $required)) { throw "Mangler fil: $required" }
 }
-foreach ($name in $testNames) {
+foreach ($name in Regression-TestNames) {
     $required = Join-Path $coachDir $name
     if (-not (Test-Path $required)) { throw "Mangler testfil: $required" }
 }
@@ -56,8 +52,8 @@ foreach ($psFile in @($coach, $automation, $selfUpdate)) {
 }
 Write-Host "Syntaks OK: $($pythonFiles.Count) Python-filer + centrale PowerShell-filer." -ForegroundColor Green
 
-Write-Host "`n3/6 Kører den samme samlede regressionssuite som selvopdatering/CI..." -ForegroundColor Cyan
-foreach ($name in $testNames) {
+Write-Host "`n3/6 Kører den fælles regressionssuite..." -ForegroundColor Cyan
+foreach ($name in Regression-TestNames) {
     $test = Join-Path $coachDir $name
     & $python $test
     if ($LASTEXITCODE -ne 0) { throw "Self-test fejlede: $name" }
