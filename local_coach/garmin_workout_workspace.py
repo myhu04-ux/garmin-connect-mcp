@@ -124,9 +124,7 @@ def executable(kind: str, minutes: float, order: int, target: dict[str, Any] | N
 
 
 def repeat_group(repetitions: int, work_min: float, recovery_min: float, target: dict[str, Any] | None) -> dict[str, Any]:
-    children = [
-        executable("interval", work_min, 2, target, "Kontrolleret kvalitetsinterval"),
-    ]
+    children = [executable("interval", work_min, 2, target, "Kontrolleret kvalitetsinterval")]
     if recovery_min > 0:
         children.append(executable("recovery", recovery_min, 3, None, "Rolig aktiv pause"))
     return {
@@ -147,38 +145,56 @@ def total_minutes(recipe: dict[str, Any]) -> float:
     work = float(recipe.get("work_min") or 0)
     recovery = float(recipe.get("recovery_min") or 0)
     cool = float(recipe.get("cooldown_min") or 0)
-    return warm + reps * work + max(0, reps - 1) * recovery + cool
+    # The Garmin repeat group executes both child steps on every iteration,
+    # including recovery after the final work bout before cooldown.
+    return warm + reps * (work + recovery) + cool
 
 
 def adjust_total(recipe: dict[str, Any], relative_minutes: float | None, requested_total: float | None) -> None:
-    """Keep the key stimulus first; trim/add easy minutes before touching work reps."""
+    """Honor duration edits while preserving the key stimulus as long as possible."""
     current = total_minutes(recipe)
     desired = requested_total if requested_total is not None else (current + relative_minutes if relative_minutes else None)
     if desired is None:
         return
     desired = max(20.0, float(desired))
     delta = desired - current
-    # Adjust cooldown then warmup within sensible floors; preserve quality block.
     cool = float(recipe.get("cooldown_min") or 0)
     warm = float(recipe.get("warmup_min") or 0)
+    recovery = float(recipe.get("recovery_min") or 0)
+    work = float(recipe.get("work_min") or 0)
+    reps = max(1, int(recipe.get("repetitions") or 1))
+
     if delta < 0:
+        # First trim easy minutes, keeping sensible floors.
         remove = min(-delta, max(0.0, cool - 5.0))
         cool -= remove
         delta += remove
         remove = min(-delta, max(0.0, warm - 8.0))
         warm -= remove
         delta += remove
+        # Then shorten recoveries slightly before reducing the work stimulus.
+        if delta < -0.01 and recovery > 1.0:
+            per_rep = min(recovery - 1.0, (-delta) / reps)
+            recovery -= per_rep
+            delta += per_rep * reps
+        if delta < -0.01 and work > 1.0:
+            per_rep = min(work - 1.0, (-delta) / reps)
+            work -= per_rep
+            delta += per_rep * reps
     elif delta > 0:
-        warm += min(delta, 10.0)
-        delta -= min(delta, 10.0)
+        add_warm = min(delta, 10.0)
+        warm += add_warm
+        delta -= add_warm
         cool += max(0.0, delta)
-    recipe["warmup_min"] = round(warm, 1)
-    recipe["cooldown_min"] = round(cool, 1)
+
+    recipe["warmup_min"] = round(warm, 2)
+    recipe["cooldown_min"] = round(cool, 2)
+    recipe["recovery_min"] = round(recovery, 2)
+    recipe["work_min"] = round(work, 2)
 
 
 def build_candidate(intent: dict[str, Any], existing_spec: dict[str, Any] | None = None, name: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     if existing_spec:
-        # Start from the prior semantic recipe and only apply newly requested fields.
         recipe = dict(existing_spec)
         fresh = training_intent.training_recipe(intent)
         if intent.get("objective") and intent.get("objective") != "general":
@@ -246,7 +262,6 @@ def _verify(readback: Any, candidate: dict[str, Any]) -> tuple[bool, str]:
 def create_or_replace_test(intent: dict[str, Any]) -> dict[str, Any]:
     current = load(STATE, {})
     if isinstance(current, dict) and current.get("workout_id"):
-        # A conversational 'lav et test-løb' reuses the single workspace instead of cluttering Garmin.
         return update_test(intent, force_objective=True)
 
     candidate, recipe = build_candidate(intent)
@@ -258,7 +273,6 @@ def create_or_replace_test(intent: dict[str, Any]) -> dict[str, Any]:
     readback = api.get_workout_by_id(wid)
     ok, detail = _verify(readback, candidate)
     if not ok:
-        # Do not leave a failed first test behind if cleanup succeeds.
         try:
             api.delete_workout(wid)
         except Exception:
@@ -329,19 +343,19 @@ def describe(result: dict[str, Any]) -> str:
     verb = "oprettet" if action == "created" else "justeret"
     recipe = result.get("recipe") or {}
     total = total_minutes(recipe)
-    bits = [
-        f"Jeg har {verb} {result.get('name')} direkte i Garmin Træninger og læst det tilbage: struktur OK.",
-        f"Formål: {recipe.get('title')}.",
-        f"Samlet ca. {total:.0f} min: {recipe.get('warmup_min')} min opvarmning",
-    ]
+    line = f"Samlet ca. {total:.0f} min: {recipe.get('warmup_min')} min opvarmning"
     reps = int(recipe.get("repetitions") or 1)
     if reps > 1:
-        bits[-1] += f", {reps} × {recipe.get('work_min')} min arbejde med {recipe.get('recovery_min')} min aktiv pause"
+        line += f", {reps} × {recipe.get('work_min')} min arbejde med {recipe.get('recovery_min')} min aktiv pause"
     else:
-        bits[-1] += f", {recipe.get('work_min')} min hoveddel"
-    bits[-1] += f" og {recipe.get('cooldown_min')} min nedjog."
-    bits.append("Det er kun oprettet under Træninger; jeg har ikke lagt det i kalenderen.")
-    return "\n".join(bits)
+        line += f", {recipe.get('work_min')} min hoveddel"
+    line += f" og {recipe.get('cooldown_min')} min nedjog."
+    return "\n".join([
+        f"Jeg har {verb} {result.get('name')} direkte i Garmin Træninger og læst det tilbage: struktur OK.",
+        f"Formål: {recipe.get('title')}.",
+        line,
+        "Det er kun oprettet under Træninger; jeg har ikke lagt det i kalenderen.",
+    ])
 
 
 def handle(message: str) -> str | None:
