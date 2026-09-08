@@ -12,25 +12,21 @@ $selfUpdate = Join-Path $repo 'local_coach\self_update.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $intentTest = Join-Path $repo 'local_coach\intent_self_test.py'
 $routerTest = Join-Path $repo 'local_coach\router_self_test.py'
-$compatTest = Join-Path $repo 'local_coach\compat_self_test.py'
+$capabilityTest = Join-Path $repo 'local_coach\garmin_capability_self_test.py'
 $calendarWriterTest = Join-Path $repo 'local_coach\calendar_writer_self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
 
-if (-not (Test-Path $python)) { throw "Mangler Python-miljø: $python" }
-if (-not (Test-Path $coach)) { throw "Mangler coach-motor: $coach" }
-if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
-if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
-if (-not (Test-Path $selfUpdate)) { throw "Mangler selvopdatering: $selfUpdate" }
-if (-not (Test-Path $intentTest)) { throw "Mangler intent-selftest: $intentTest" }
-if (-not (Test-Path $routerTest)) { throw "Mangler router-selftest: $routerTest" }
-if (-not (Test-Path $compatTest)) { throw "Mangler compatibility-selftest: $compatTest" }
-if (-not (Test-Path $calendarWriterTest)) { throw "Mangler calendar-writer-selftest: $calendarWriterTest" }
+foreach ($required in @($python,$coach,$ui,$chat,$selfUpdate,$intentTest,$routerTest,$capabilityTest,$calendarWriterTest)) {
+    if (-not (Test-Path $required)) { throw "Mangler fil: $required" }
+}
 
-Write-Host "`n1/6 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
-& $python -m pip install -e $repo
+Write-Host "`n1/6 Installerer den fastlåste Garmin-klient og øvrige afhængigheder..." -ForegroundColor Cyan
+& $python -m pip install --upgrade -e $repo
 if ($LASTEXITCODE -ne 0) { throw 'Python-afhængigheder kunne ikke installeres.' }
+& $python $capabilityTest
+if ($LASTEXITCODE -ne 0) { throw 'Den installerede Garmin-klient har ikke de native workout/kalender-metoder coachen kræver.' }
 
 Write-Host "`n2/6 Kontrollerer syntaks i hele coach-appen..." -ForegroundColor Cyan
 $pythonFiles = Get-ChildItem -Path $coachDir -Filter '*.py' -File
@@ -44,22 +40,16 @@ foreach ($psFile in @($coach, $automation, $selfUpdate)) {
     [System.Management.Automation.Language.Parser]::ParseFile($psFile, [ref]$tokens, [ref]$parseErrors) | Out-Null
     if ($parseErrors -and $parseErrors.Count -gt 0) {
         $messages = ($parseErrors | ForEach-Object { $_.Message }) -join '; '
-        throw "PowerShell-syntaksfejl i $([IO.Path]::GetFileName($psFile)): $messages. Den gamle UI stoppes ikke."
+        throw "PowerShell-syntaksfejl i $([IO.Path]::GetFileName($psFile)): $messages."
     }
 }
 Write-Host "Syntaks OK: $($pythonFiles.Count) Python-filer + centrale PowerShell-filer." -ForegroundColor Green
 
 Write-Host "`n3/6 Kører offline sikkerheds- og sprogtests..." -ForegroundColor Cyan
-& $python $selfTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. Den gamle UI stoppes ikke.' }
-& $python $intentTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens sprog/workout-intent tests fejlede. Den gamle UI stoppes ikke.' }
-& $python $routerTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens naturlige samtalerouting fejlede. Den gamle UI stoppes ikke.' }
-& $python $compatTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens Garmin-kompatibilitetsfallback fejlede. Den gamle UI stoppes ikke.' }
-& $python $calendarWriterTest
-if ($LASTEXITCODE -ne 0) { throw 'Coachens kalendertransaktionstest fejlede. Den gamle UI stoppes ikke.' }
+foreach ($test in @($selfTest,$intentTest,$routerTest,$calendarWriterTest)) {
+    & $python $test
+    if ($LASTEXITCODE -ne 0) { throw "Self-test fejlede: $test" }
+}
 
 Write-Host "`n4/6 Installerer automatisk coach, dashboard, direkte chat og selvopdatering..." -ForegroundColor Cyan
 try {
@@ -67,7 +57,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Scheduler returnerede fejl.' }
 } catch {
     Write-Host "ADVARSEL: Windows-automatik kunne ikke installeres endnu: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host 'UI kan stadig bruges; automatik kan installeres fra UI senere.' -ForegroundColor Yellow
 }
 
 Write-Host "`n5/6 Genstarter dashboard og coach-chat sikkert..." -ForegroundColor Cyan
@@ -75,9 +64,7 @@ try {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and ($_.CommandLine -like '*local_coach*coach_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_ui.py*' -or $_.CommandLine -like '*local_coach*coach_chat_fast.py*' -or $_.CommandLine -like '*local_coach*coach_chat_agent.py*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-} catch {
-    Write-Host "ADVARSEL: Kunne ikke stoppe gammel UI automatisk: $($_.Exception.Message)" -ForegroundColor Yellow
-}
+} catch {}
 Start-Sleep -Milliseconds 800
 $uiPython = if (Test-Path $pythonw) { $pythonw } else { $python }
 Start-Process -FilePath $uiPython -ArgumentList @($ui, '--no-browser') -WindowStyle Hidden
@@ -88,16 +75,10 @@ $chatReady = $false
 for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 500
     if (-not $dashboardReady) {
-        try {
-            Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -Method Get -TimeoutSec 2 | Out-Null
-            $dashboardReady = $true
-        } catch {}
+        try { Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/status' -Method Get -TimeoutSec 2 | Out-Null; $dashboardReady = $true } catch {}
     }
     if (-not $chatReady) {
-        try {
-            Invoke-RestMethod -Uri 'http://127.0.0.1:8766/api/status' -Method Get -TimeoutSec 2 | Out-Null
-            $chatReady = $true
-        } catch {}
+        try { Invoke-RestMethod -Uri 'http://127.0.0.1:8766/api/status' -Method Get -TimeoutSec 2 | Out-Null; $chatReady = $true } catch {}
     }
     if ($dashboardReady -and $chatReady) { break }
 }
@@ -108,16 +89,12 @@ Write-Host "`n6/6 Starter frisk Garmin-opdatering gennem UI'et..." -ForegroundCo
 try {
     $body = @{ kind = 'status'; text = '' } | ConvertTo-Json -Compress
     Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/run' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5 | Out-Null
-    Write-Host 'Garmin-opdatering er startet og kan følges i browseren.' -ForegroundColor Green
-} catch {
-    Write-Host 'UI har allerede startet/opfanget coach-opdateringen. Fortsætter.' -ForegroundColor Yellow
-}
+} catch {}
 Start-Process 'http://127.0.0.1:8765/'
 
 Write-Host "`n=== FÆRDIG ===" -ForegroundColor Green
 Write-Host 'Dashboard: http://127.0.0.1:8765/'
 Write-Host 'Tal direkte med coachen: http://127.0.0.1:8766/'
 Write-Host "Fremtidige kodeopdateringer: skriv 'opdater dig selv' til coach-chatten."
-Write-Host 'Coachen tjekker desuden efter kodeopdateringer ved Windows-login.'
 Write-Host 'Automatisk analyse: mandag, torsdag og søndag kl. 22:00.'
-Write-Host 'Automatisk kalender-writeback er fortsat låst; test-workout-chatten kan kun ændre det aktive test-workout og dets egen kalenderplacering.' -ForegroundColor Yellow
+Write-Host 'Automatisk kalender-writeback er fortsat låst.' -ForegroundColor Yellow
