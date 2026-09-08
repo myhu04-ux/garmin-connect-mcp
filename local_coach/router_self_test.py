@@ -31,8 +31,14 @@ def test_compound_edit_and_move() -> None:
     assert result["parsed_intent"]["relative_minutes"] == -10, result
 
 
+def test_terse_edit_followup() -> None:
+    result = conversation_router.route("10 minutter kortere")
+    assert result["update_requested"], result
+    assert result["has_update_parameters"], result
+    assert result["parsed_intent"]["relative_minutes"] == -10, result
+
+
 def test_destination_wins_over_source() -> None:
-    # Use a fixed Tuesday so the intended destination is deterministic.
     original = conversation_router.training_intent.parse_target_date
     try:
         def fixed_parse(text: str):
@@ -55,6 +61,7 @@ def main() -> int:
         test_user_move_phrase,
         test_user_correction_phrase,
         test_compound_edit_and_move,
+        test_terse_edit_followup,
         test_destination_wins_over_source,
         test_put_phrase,
     ]
