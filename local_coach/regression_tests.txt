@@ -10,3 +10,4 @@ core_evidence_self_test.py
 planned_workout_compiler_self_test.py
 writeback_transaction_self_test.py
 named_workout_self_test.py
+research_intent_self_test.py
