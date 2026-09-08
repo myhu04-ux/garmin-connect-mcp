@@ -11,6 +11,7 @@ $automation = Join-Path $repo 'local_coach\install_automation.ps1'
 $selfTest = Join-Path $repo 'local_coach\self_test.py'
 $intentTest = Join-Path $repo 'local_coach\intent_self_test.py'
 $routerTest = Join-Path $repo 'local_coach\router_self_test.py'
+$compatTest = Join-Path $repo 'local_coach\compat_self_test.py'
 $coachDir = Join-Path $repo 'local_coach'
 
 Write-Host '=== GARMIN LOCAL COACH - INSTALLATION / OPDATERING ===' -ForegroundColor Cyan
@@ -21,6 +22,7 @@ if (-not (Test-Path $ui)) { throw "Mangler coach-UI: $ui" }
 if (-not (Test-Path $chat)) { throw "Mangler coach-chat: $chat" }
 if (-not (Test-Path $intentTest)) { throw "Mangler intent-selftest: $intentTest" }
 if (-not (Test-Path $routerTest)) { throw "Mangler router-selftest: $routerTest" }
+if (-not (Test-Path $compatTest)) { throw "Mangler compatibility-selftest: $compatTest" }
 
 Write-Host "`n1/6 Opdaterer gratis Python-afhængigheder..." -ForegroundColor Cyan
 & $python -m pip install -e $repo
@@ -50,6 +52,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Coachens kritiske selvtests fejlede. Den gamle
 if ($LASTEXITCODE -ne 0) { throw 'Coachens sprog/workout-intent tests fejlede. Den gamle UI stoppes ikke.' }
 & $python $routerTest
 if ($LASTEXITCODE -ne 0) { throw 'Coachens naturlige samtalerouting fejlede. Den gamle UI stoppes ikke.' }
+& $python $compatTest
+if ($LASTEXITCODE -ne 0) { throw 'Coachens Garmin-kompatibilitetsfallback fejlede. Den gamle UI stoppes ikke.' }
 
 Write-Host "`n4/6 Installerer automatisk coach, dashboard og direkte chat..." -ForegroundColor Cyan
 try {
