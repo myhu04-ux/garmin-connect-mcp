@@ -41,17 +41,19 @@ def route(message: str) -> dict[str, Any]:
     target_date = destination_date(lower)
     parsed = training_intent.deterministic(text)
 
-    move = bool(MOVE_RE.search(text)) and bool(target_date or CALENDAR_RE.search(text))
-    add = bool(ADD_RE.search(text)) and bool(target_date or CALENDAR_RE.search(text))
-    remove_calendar = bool(REMOVE_CAL_RE.search(text))
-    update = bool(UPDATE_RE.search(text)) and bool(TEST_REF_RE.search(text))
-    delete_workout = bool(DELETE_WORKOUT_RE.search(text)) and not remove_calendar
-
     update_fields = (
         "duration_min", "distance_km", "repetitions", "work_min", "recovery_min",
         "warmup_min", "cooldown_min", "relative_minutes",
     )
     has_update_parameters = any(parsed.get(k) is not None for k in update_fields)
+
+    move = bool(MOVE_RE.search(text)) and bool(target_date or CALENDAR_RE.search(text))
+    add = bool(ADD_RE.search(text)) and bool(target_date or CALENDAR_RE.search(text))
+    remove_calendar = bool(REMOVE_CAL_RE.search(text))
+    # A terse follow-up such as '10 minutter kortere' is still an edit request
+    # because the edit word and an explicit measurable change are both present.
+    update = bool(UPDATE_RE.search(text)) and bool(TEST_REF_RE.search(text) or has_update_parameters)
+    delete_workout = bool(DELETE_WORKOUT_RE.search(text)) and not remove_calendar
 
     calendar_operation = None
     if remove_calendar:
