@@ -19,7 +19,7 @@ import conversation_router
 import garmin_method_catalog as catalog
 import garmin_workout_workspace
 import model_manager
-import shadow_week
+import shadow_week_expert
 import test_workout_calendar
 import training_intent
 import workout_selfheal
@@ -85,11 +85,10 @@ def wants_shadow_week(message: str) -> bool:
 
 def shadow_week_answer(message: str) -> str:
     try:
-        return shadow_week.handle(message)
+        return shadow_week_expert.handle(message)
     except Exception as exc:
         text = str(exc)
-        # Model installation/status is a normal transient state, not a fake coaching answer.
-        if "coach-model" in text or "installeres lokalt" in text or "qwen3:4b" in text:
+        if "coach-model" in text or "installeres lokalt" in text or "qwen3:8b" in text:
             return text
         return f"Jeg kunne ikke generere ugeplanen sikkert: {text}"
 
@@ -195,8 +194,6 @@ def answer(message: str) -> str:
     if wants_self_update(message):
         return start_self_update()
 
-    # Weekly coaching must never fall through to the tiny chat model. This catches
-    # natural benchmark wording such as 'hvordan skal uge 38 se ud på baggrund af ...'.
     if wants_shadow_week(message):
         return shadow_week_answer(message)
 
