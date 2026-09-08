@@ -2,14 +2,14 @@
 
 No network/Garmin calls. These tests make sure the coach never assumes an installed
 Garmin client exposes update_workout(), and that the replacement strategy preserves
-calendar placement before deleting the old workout.
+calendar placement even when Garmin read-back is briefly stale.
 """
 
 from __future__ import annotations
 
 import copy
-import datetime as dt
 
+import calendar_consistency
 import workout_replace_compat as compat
 
 
@@ -37,6 +37,8 @@ class FakeGarmin:
         self.deleted = []
         self.next_workout_id = 20
         self.next_scheduled_id = 200
+        self.stale_rows: list[dict] = []
+        self.stale_reads_remaining = 0
 
     def get_workout_by_id(self, workout_id):
         return copy.deepcopy(self.workouts.get(int(workout_id)))
@@ -61,14 +63,33 @@ class FakeGarmin:
         return {"scheduledWorkoutId": sid}
 
     def unschedule_workout(self, scheduled_id):
-        self.calendar = [x for x in self.calendar if str(x.get("scheduled_workout_id")) != str(scheduled_id)]
+        removed = [
+            copy.deepcopy(x) for x in self.calendar
+            if str(x.get("scheduled_workout_id")) == str(scheduled_id)
+        ]
+        self.calendar = [
+            x for x in self.calendar
+            if str(x.get("scheduled_workout_id")) != str(scheduled_id)
+        ]
+        # Simulate Garmin acknowledging the write while two subsequent reads still
+        # return its cached old calendar row.
+        if removed and str(scheduled_id) == "100":
+            self.stale_rows = removed
+            self.stale_reads_remaining = 2
+
+    def month_rows(self):
+        rows = copy.deepcopy(self.calendar)
+        if self.stale_reads_remaining > 0:
+            rows.extend(copy.deepcopy(self.stale_rows))
+            self.stale_reads_remaining -= 1
+        return rows
 
     def delete_workout(self, workout_id):
         self.deleted.append(int(workout_id))
         self.workouts.pop(int(workout_id), None)
 
 
-def test_transactional_replace() -> None:
+def test_transactional_replace_with_stale_calendar_reads() -> None:
     fake = FakeGarmin()
     state = {
         "workout_id": 10,
@@ -95,6 +116,7 @@ def test_transactional_replace() -> None:
     original_login = compat.workspace.login
     original_verify = compat.workspace._verify
     original_month_rows = compat._month_rows
+    original_sleep = calendar_consistency.time.sleep
     try:
         compat.workspace.load = lambda path, default: copy.deepcopy(state)
         compat.workspace.save = lambda path, payload: saved.update(copy.deepcopy(payload))
@@ -110,7 +132,8 @@ def test_transactional_replace() -> None:
         )
         compat.workspace.login = lambda: fake
         compat.workspace._verify = lambda readback, candidate: (True, "OK", {"actual_execution": {"ok": True}})
-        compat._month_rows = lambda api, day: copy.deepcopy(fake.calendar)
+        compat._month_rows = lambda api, day: fake.month_rows()
+        calendar_consistency.time.sleep = lambda seconds: None
 
         result = compat.replace_update({"operation": "update_test_workout", "relative_minutes": -10})
     finally:
@@ -120,6 +143,7 @@ def test_transactional_replace() -> None:
         compat.workspace.login = original_login
         compat.workspace._verify = original_verify
         compat._month_rows = original_month_rows
+        calendar_consistency.time.sleep = original_sleep
 
     assert result["workout_id"] == 20, result
     assert saved["workout_id"] == 20, saved
@@ -127,6 +151,7 @@ def test_transactional_replace() -> None:
     assert all(str(x.get("workout_id")) != "10" for x in fake.calendar), fake.calendar
     assert any(str(x.get("workout_id")) == "20" and x.get("date") == "2026-09-10" for x in fake.calendar), fake.calendar
     assert saved.get("scheduled_workout_id") == 200, saved
+    assert fake.stale_reads_remaining == 0, fake.stale_reads_remaining
 
 
 def main() -> int:
@@ -134,8 +159,8 @@ def main() -> int:
     assert compat.supports_inplace_update(NewGarminClient()) is True
     print("OK: gammel Garmin-klient uden update_workout opdages")
     print("OK: nyere Garmin-klient med update_workout opdages")
-    test_transactional_replace()
-    print("OK: erstatningsstrategien migrerer kalenderen og sletter først gammel workout til sidst")
+    test_transactional_replace_with_stale_calendar_reads()
+    print("OK: erstatningsstrategien tåler forsinket Garmin-kalender read-back")
     return 0
 
 
