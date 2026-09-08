@@ -11,7 +11,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -251,6 +250,7 @@ def generate(force: bool = False) -> dict[str, Any]:
             print(render(cached))
             return cached
 
+    stale_existing = False
     try:
         first_raw = call_model(context)
         first_plan = preview.validate(first_raw, context, library)
@@ -275,31 +275,34 @@ def generate(force: bool = False) -> dict[str, Any]:
         plan["quality_review"] = {"repair_used": repair_used, "remaining_issues": issues, "passed": not issues}
     except Exception as exc:
         existing = preview.load(OUT, {})
-        # During first background model download, keeping a previously validated
-        # plan is safer than blocking the whole dashboard. On first-ever run use a
-        # deterministic KEEP-only fallback.
         if isinstance(existing, dict) and existing.get("actions"):
-            plan = existing
+            # Preserve the old fingerprint/timestamp so this stale plan can never be
+            # mistaken for a successful plan over the new inputs.
+            plan = dict(existing)
             plan["expert_refresh_warning"] = str(exc)[:500]
-            plan["source"] = plan.get("source") or "previous_validated_preview"
+            plan["stale_for_current_input"] = True
+            plan["last_refresh_attempt_at"] = dt.datetime.now().astimezone().isoformat()
+            stale_existing = True
         else:
             plan = fallback_plan(context, library, exc)
             plan["quality_review"] = {"repair_used": False, "remaining_issues": ["Ekspertmodellen var ikke klar; kun konservativ fallback vises."], "passed": False}
 
-    plan["generated_at"] = dt.datetime.now().astimezone().isoformat()
-    plan["planning_mode"] = "adaptive_rolling_7d"
-    plan["planning_window"] = context.get("planning_window")
-    plan["input_fingerprint"] = fp
-    plan["preview_only"] = True
-    plan["garmin_writeback"] = False
-    plan["benchmark_context"] = {
-        "model": model_manager.COACH_MODEL,
-        "training_windows": len(context.get("training_history_4x7d") or []),
-        "activity_details": len(context.get("recent_activity_detail_28d") or []),
-        "health_days": len(context.get("recent_health_detail_14d") or []),
-        "session_response_examples": len(context.get("personal_session_response_examples") or []),
-        "evidence_principles": len(context.get("external_plan_principles") or []),
-    }
+    if not stale_existing:
+        plan["generated_at"] = dt.datetime.now().astimezone().isoformat()
+        plan["planning_mode"] = "adaptive_rolling_7d"
+        plan["planning_window"] = context.get("planning_window")
+        plan["input_fingerprint"] = fp
+        plan["stale_for_current_input"] = False
+        plan["preview_only"] = True
+        plan["garmin_writeback"] = False
+        plan["benchmark_context"] = {
+            "model": model_manager.COACH_MODEL,
+            "training_windows": len(context.get("training_history_4x7d") or []),
+            "activity_details": len(context.get("recent_activity_detail_28d") or []),
+            "health_days": len(context.get("recent_health_detail_14d") or []),
+            "session_response_examples": len(context.get("personal_session_response_examples") or []),
+            "evidence_principles": len(context.get("external_plan_principles") or []),
+        }
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
