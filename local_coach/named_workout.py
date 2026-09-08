@@ -1,9 +1,9 @@
-"""Create/reuse a named Garmin workout copy from an approved master.
+"""Create/reuse a verified named Garmin workout copy from an approved master.
 
 This module is only used by guarded write-back. Master workouts are never updated.
-A new copy removes Garmin-owned IDs exactly as demonstrated by python-garminconnect,
-gets the athlete-facing plan name (for example ThyTrailW3D4), and is cached locally
-so repeated coach runs reuse the same uploaded copy.
+Coach-owned copies are semantically read back from Garmin before their id can be used
+in the calendar. A cached coach copy that drifted may be restored in place, with
+rollback metadata returned to the outer transaction layer.
 """
 
 from __future__ import annotations
@@ -68,19 +68,37 @@ def sanitized_copy(master_raw: dict[str, Any], workout_name: str) -> dict[str, A
     return data
 
 
+def _semantic_verify(expected: dict[str, Any], actual: Any) -> tuple[bool, str]:
+    """Late import avoids a module cycle: workout_lab imports helpers from here."""
+    if not isinstance(actual, dict):
+        return False, "Garmin returnerede ikke workout-data ved read-back."
+    import workout_lab  # local import by design
+
+    expected_sig = workout_lab.normalized_signature(workout_lab.semantic_signature(expected))
+    actual_sig = workout_lab.normalized_signature(workout_lab.semantic_signature(actual))
+    differences = workout_lab.signature_differences(expected_sig, actual_sig)
+    expected_name = str(expected.get("workoutName") or "")
+    actual_name = str(actual.get("workoutName") or "")
+    if actual_name != expected_name:
+        differences.insert(0, f"navn {actual_name!r} != {expected_name!r}")
+    if differences:
+        return False, "; ".join(differences[:6])
+    return True, "OK"
+
+
+def _read(api: Any, workout_id: Any) -> dict[str, Any] | None:
+    try:
+        value = api.get_workout_by_id(workout_id)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
 def ensure_named_workout(api: Any, source_workout_id: Any, workout_name: str) -> tuple[Any, dict[str, Any]]:
-    """Return workout id plus metadata. Upload only when not already cached."""
+    """Return only a Garmin id whose execution contract passed live read-back."""
     name = str(workout_name or "").strip()
     if not name:
         raise RuntimeError("Mangler plan-navn til personlig Garmin-workout.")
-
-    cache = load(CACHE, {})
-    entries = cache.get("entries") if isinstance(cache, dict) else None
-    if not isinstance(entries, dict):
-        entries = {}
-    cached = entries.get(name)
-    if isinstance(cached, dict) and str(cached.get("source_workout_id") or "") == str(source_workout_id or "") and cached.get("workout_id"):
-        return cached["workout_id"], {"created": False, "cached": True, "name": name, "source_workout_id": source_workout_id}
 
     master = find_master(source_workout_id)
     if not master:
@@ -88,18 +106,98 @@ def ensure_named_workout(api: Any, source_workout_id: Any, workout_name: str) ->
     raw = master.get("raw")
     if not isinstance(raw, dict):
         raise RuntimeError(f"Master-workout {source_workout_id} mangler rå Garmin-struktur.")
+    expected = sanitized_copy(raw, name)
 
-    payload = sanitized_copy(raw, name)
-    result = api.upload_workout(payload)
+    cache = load(CACHE, {})
+    entries = cache.get("entries") if isinstance(cache, dict) else None
+    if not isinstance(entries, dict):
+        entries = {}
+    cached = entries.get(name)
+
+    if (
+        isinstance(cached, dict)
+        and str(cached.get("source_workout_id") or "") == str(source_workout_id or "")
+        and cached.get("workout_id")
+    ):
+        workout_id = cached["workout_id"]
+        current = _read(api, workout_id)
+        if isinstance(current, dict):
+            ok, detail = _semantic_verify(expected, current)
+            if ok:
+                return workout_id, {
+                    "created": False,
+                    "updated": False,
+                    "cached": True,
+                    "readback_ok": True,
+                    "name": name,
+                    "source_workout_id": source_workout_id,
+                }
+
+            # This id is a coach-owned copy (proven by our local cache), never the
+            # approved master. Restore it to the current master semantics in place.
+            old = copy.deepcopy(current)
+            try:
+                api.update_workout(workout_id, copy.deepcopy(expected))
+                readback = _read(api, workout_id)
+                verified, verify_detail = _semantic_verify(expected, readback)
+                if not verified:
+                    raise RuntimeError(verify_detail)
+            except Exception as exc:
+                try:
+                    api.update_workout(workout_id, old)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"Coach-kopien afveg ({detail}); opdatering fejlede ({exc}) og rollback fejlede ({rollback_exc})."
+                    ) from exc
+                raise RuntimeError(
+                    f"Coach-kopien afveg fra master ({detail}); Garmin-opdatering blev rullet tilbage: {exc}"
+                ) from exc
+
+            cached = dict(cached)
+            cached["verified_at"] = dt.datetime.now().astimezone().isoformat()
+            cached["source_title"] = master.get("title")
+            entries[name] = cached
+            save(CACHE, {"updated_at": dt.datetime.now().astimezone().isoformat(), "entries": entries})
+            return workout_id, {
+                "created": False,
+                "updated": True,
+                "cached": False,
+                "readback_ok": True,
+                "name": name,
+                "source_workout_id": source_workout_id,
+            }
+
+        # Stale cache id: drop only the local reference, never guess/delete a Garmin
+        # object we can no longer read. A fresh verified coach copy is created below.
+        entries.pop(name, None)
+
+    result = api.upload_workout(expected)
     if not isinstance(result, dict) or not result.get("workoutId"):
         raise RuntimeError(f"Garmin returnerede ikke workoutId efter upload af {name}.")
     new_id = result["workoutId"]
+
+    readback = _read(api, new_id)
+    ok, detail = _semantic_verify(expected, readback)
+    if not ok:
+        try:
+            api.delete_workout(new_id)
+        except Exception:
+            pass
+        raise RuntimeError(f"Den nye Garmin-kopi {name} bestod ikke workout read-back: {detail}")
 
     entries[name] = {
         "workout_id": new_id,
         "source_workout_id": source_workout_id,
         "source_title": master.get("title"),
         "created_at": dt.datetime.now().astimezone().isoformat(),
+        "verified_at": dt.datetime.now().astimezone().isoformat(),
     }
     save(CACHE, {"updated_at": dt.datetime.now().astimezone().isoformat(), "entries": entries})
-    return new_id, {"created": True, "cached": False, "name": name, "source_workout_id": source_workout_id}
+    return new_id, {
+        "created": True,
+        "updated": False,
+        "cached": False,
+        "readback_ok": True,
+        "name": name,
+        "source_workout_id": source_workout_id,
+    }
