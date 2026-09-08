@@ -20,7 +20,7 @@ import core_evidence
 
 OLLAMA_ROOT = "http://127.0.0.1:11434"
 PARSER_MODEL = "qwen3:1.7b"
-FAST_MODEL = PARSER_MODEL  # backwards-compatible name for constrained parser modules
+FAST_MODEL = PARSER_MODEL
 CHAT_MODEL = "qwen3:4b"
 COACH_MODEL = "qwen3:8b"
 STATUS = Path(r"C:\GarminCoach\data\model_status.json")
@@ -92,8 +92,6 @@ def is_installed(model: str) -> bool:
 
 
 def pull_model(model: str) -> None:
-    # Ollama can technically handle concurrent pulls, but serial downloads are kinder
-    # to this older laptop and make progress/error states much easier to reason about.
     with _DOWNLOAD_LOCK:
         _save_model(model, {"state": "checking", "progress_pct": 0})
         try:
@@ -185,6 +183,17 @@ def ensure_coach_model_background() -> dict[str, Any]:
 
 
 def ensure_all_models_background() -> None:
-    # Start the chat model first so ordinary conversation becomes useful sooner.
-    ensure_chat_model_background()
-    ensure_coach_model_background()
+    """Prepare 4B first, then 8B, in one background worker.
+
+    This function itself may block while downloading, so callers should run it in a
+    daemon/background thread (the chat agent does). A user request can still trigger a
+    missing model independently; _DOWNLOAD_LOCK keeps actual downloads serialized.
+    """
+    if not is_installed(CHAT_MODEL):
+        pull_model(CHAT_MODEL)
+    else:
+        _save_model(CHAT_MODEL, {"state": "ready", "progress_pct": 100})
+    if not is_installed(COACH_MODEL):
+        pull_model(COACH_MODEL)
+    else:
+        _save_model(COACH_MODEL, {"state": "ready", "progress_pct": 100})
