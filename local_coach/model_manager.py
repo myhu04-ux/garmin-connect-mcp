@@ -1,8 +1,9 @@
-"""Manage the two local Ollama brains used by Garmin Coach.
+"""Manage the local Ollama models used by Garmin Coach.
 
-FAST_MODEL is for short conversational turns. COACH_MODEL is deliberately larger and
-is reserved for weekly planning / deeper coaching. The larger model is downloaded in
-the background so the web UI stays responsive. Status is persisted for the UI/chat.
+COACH_MODEL is the athlete-facing expert model for free-form coaching and planning.
+FAST_MODEL remains available only for tightly constrained internal parsing helpers.
+The expert model is downloaded in the background so the local web UI stays responsive.
+The curated evidence library is also seeded into training_knowledge at import time.
 """
 
 from __future__ import annotations
@@ -15,14 +16,21 @@ from typing import Any
 
 import requests
 
+import core_evidence
+
 OLLAMA_ROOT = "http://127.0.0.1:11434"
 FAST_MODEL = "qwen3:1.7b"
-# Official Ollama library tag. 8B is intentionally chosen for weekly/deep coaching
-# quality; the Acer has ample system RAM even if the whole model cannot stay in VRAM.
 COACH_MODEL = "qwen3:8b"
 STATUS = Path(r"C:\GarminCoach\data\model_status.json")
 _LOCK = threading.Lock()
 _PULL_THREAD: threading.Thread | None = None
+
+# Evidence seeding must never make model import fail; write problems are surfaced by
+# normal coach diagnostics later. Existing user-researched plan references are kept.
+try:
+    core_evidence.seed_training_knowledge()
+except Exception:
+    pass
 
 
 def _save(payload: dict[str, Any]) -> None:
@@ -137,4 +145,4 @@ def coach_model_ready() -> tuple[bool, str]:
     if state == "error":
         return False, f"Den større coach-model kunne ikke installeres: {current.get('error') or 'ukendt fejl'}"
     suffix = f" ({pct}%)" if pct is not None else ""
-    return False, f"Den større coach-model {COACH_MODEL} installeres lokalt{suffix}. Prøv ugeplanen igen, når den er klar."
+    return False, f"Den større coach-model {COACH_MODEL} installeres lokalt{suffix}. Prøv igen, når den er klar."
