@@ -1,14 +1,11 @@
-"""Safer entry point for calendar_writer.
+"""Transactional entry point for guarded Garmin calendar write-back.
 
-Adds guards around the core writer:
-1) every read-back covers the full 7-day horizon, including month boundaries;
-2) schedule/move is transactional and waits for Garmin read-back convergence;
-3) final action verification retries because Garmin calendar reads can be stale;
-4) expert ADD/ADJUST actions may resolve to a verified coach-generated structured
-   workout; strength still uses the approved master copy;
-5) only during explicit --test-one, if the adaptive plan has no ADD/ADJUST/MOVE,
-   one FUTURE KEEP may be replaced by a same-content named copy. Normal automatic
-   apply never synthesizes changes.
+This wrapper keeps the existing permission gates from calendar_writer and adds:
+1) full-horizon read-back across month boundaries;
+2) delayed Garmin consistency retries;
+3) expert session specs compiled to verified coach-owned workouts;
+4) transaction rollback across BOTH workout-library changes and calendar placement;
+5) the explicit one-action test fallback. Normal automatic apply never invents work.
 """
 
 from __future__ import annotations
@@ -19,11 +16,12 @@ from typing import Any
 
 import calendar_consistency
 import calendar_writer as base
-import planned_workout_compiler
+import writeback_transaction
 from calendar_probe import extract_items
 
 _ORIGINAL_ACTIONABLE = base.actionable
 _ORIGINAL_VERIFY = base.verify_action
+_ORIGINAL_APPLY = base.apply_action
 
 
 def full_window_calendar(api: Any, action: dict[str, Any]) -> dict[str, Any]:
@@ -34,7 +32,7 @@ def full_window_calendar(api: Any, action: dict[str, Any]) -> dict[str, Any]:
         base.parse_date(action.get("date")),
         base.parse_date(action.get("source_date")),
     ]
-    months: set[tuple[int, int]] = {(d.year, d.month) for d in dates if d}
+    months: set[tuple[int, int]] = {(day.year, day.month) for day in dates if day}
     items: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for year, month in sorted(months):
@@ -50,25 +48,124 @@ def full_window_calendar(api: Any, action: dict[str, Any]) -> dict[str, Any]:
     return {"items": items}
 
 
-def _entry_for(api: Any, workout_id: Any, date: str) -> dict[str, Any] | None:
+def _entries_for(api: Any, workout_id: Any, date: Any) -> list[dict[str, Any]]:
     day = base.parse_date(date)
     if not day:
-        return None
+        return []
     wid = str(workout_id or "")
-    for item in extract_items(api.get_scheduled_workouts(day.year, day.month)):
-        if str(item.get("workout_id") or "") == wid and str(item.get("date") or "")[:10] == day.isoformat():
-            return item
-    return None
+    return [
+        item
+        for item in extract_items(api.get_scheduled_workouts(day.year, day.month))
+        if str(item.get("workout_id") or "") == wid
+        and str(item.get("date") or "")[:10] == day.isoformat()
+    ]
+
+
+def _entry_for(api: Any, workout_id: Any, date: str) -> dict[str, Any] | None:
+    rows = _entries_for(api, workout_id, date)
+    return rows[0] if rows else None
 
 
 def _sid_present(api: Any, scheduled_id: Any, dates: list[dt.date]) -> dict[str, Any] | None:
     sid = str(scheduled_id or "")
-    months = {(d.year, d.month) for d in dates if d}
+    months = {(day.year, day.month) for day in dates if day}
     for year, month in sorted(months):
         for item in extract_items(api.get_scheduled_workouts(year, month)):
             if str(item.get("scheduled_workout_id") or "") == sid:
                 return item
     return None
+
+
+def _original_scheduled_ids(calendar: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("scheduled_workout_id"))
+        for item in base.calendar_items(calendar)
+        if item.get("scheduled_workout_id") not in (None, "")
+    }
+
+
+def rollback_calendar_state(
+    api: Any,
+    original_calendar: dict[str, Any],
+    new_workout_id: Any,
+    target_date: str,
+    old_item: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Best-effort restore of the pre-action calendar state.
+
+    Old placement is restored before a newly-created target placement is removed. That
+    ordering means a rollback never intentionally leaves the athlete with neither the
+    old nor the new session if Garmin is temporarily inconsistent.
+    """
+    errors: list[str] = []
+    old_ready = old_item is None
+
+    if old_item is not None:
+        old_wid = old_item.get("workout_id")
+        old_date = str(old_item.get("date") or "")[:10]
+        if old_wid and old_date:
+            if _entry_for(api, old_wid, old_date):
+                old_ready = True
+            else:
+                try:
+                    api.schedule_workout(old_wid, old_date)
+                    ok, _value = calendar_consistency.wait_present(
+                        lambda: _entry_for(api, old_wid, old_date),
+                        attempts=8,
+                    )
+                    old_ready = bool(ok)
+                    if not old_ready:
+                        errors.append("den oprindelige kalenderpost blev ikke synlig igen")
+                except Exception as exc:
+                    errors.append(f"kunne ikke gendanne den oprindelige kalenderpost: {exc}")
+
+    original_ids = _original_scheduled_ids(original_calendar)
+    if old_ready:
+        try:
+            target_rows = _entries_for(api, new_workout_id, target_date)
+        except Exception as exc:
+            target_rows = []
+            errors.append(f"kunne ikke læse mål-dato under rollback: {exc}")
+        for row in target_rows:
+            sid = row.get("scheduled_workout_id")
+            if not sid or str(sid) in original_ids:
+                continue
+            try:
+                api.unschedule_workout(sid)
+                source_day = base.parse_date((old_item or {}).get("date"))
+                target_day = base.parse_date(target_date)
+                ok, _ = calendar_consistency.wait_absent(
+                    lambda sid=sid: _sid_present(api, sid, [d for d in (source_day, target_day) if d]),
+                    attempts=8,
+                )
+                if not ok:
+                    errors.append(f"ny kalenderpost {sid} blev ikke bekræftet fjernet")
+            except Exception as exc:
+                errors.append(f"kunne ikke fjerne ny kalenderpost {sid}: {exc}")
+    elif new_workout_id:
+        errors.append("mål-posten blev bevaret, fordi den oprindelige post ikke kunne gendannes sikkert")
+
+    return (not errors), ("Kalenderen blev gendannet." if not errors else "; ".join(errors))
+
+
+def rollback_everything(
+    api: Any,
+    original_calendar: dict[str, Any],
+    action: dict[str, Any],
+    resolved_workout_id: Any,
+) -> str:
+    old_item = base.find_source(original_calendar, action)
+    target_date = str(action.get("date") or "")[:10]
+    cal_ok, cal_detail = rollback_calendar_state(
+        api,
+        original_calendar,
+        resolved_workout_id,
+        target_date,
+        old_item,
+    )
+    workout_ok, workout_detail = writeback_transaction.rollback(api, resolved_workout_id)
+    status = "OK" if cal_ok and workout_ok else "MED FORBEHOLD"
+    return f"Rollback {status}: kalender={cal_detail}; workout={workout_detail}"
 
 
 def transactional_schedule_then_unschedule(
@@ -83,48 +180,66 @@ def transactional_schedule_then_unschedule(
     schedule_response: Any = None
     new_entry = already
 
-    if not already:
-        schedule_response = api.schedule_workout(new_workout_id, target_date)
-        ok, value = calendar_consistency.wait_present(
-            lambda: _entry_for(api, new_workout_id, target_date),
-            attempts=8,
-        )
-        if not ok or not isinstance(value, dict):
-            raise RuntimeError("Garmin accepterede schedule-kaldet, men det nye pas blev ikke synligt ved gentaget read-back.")
-        new_entry = value
-        created_new = True
-
-    unscheduled = False
-    if old_item:
-        old_scheduled_id = old_item.get("scheduled_workout_id")
-        same_entry = (
-            str(old_item.get("workout_id") or "") == str(new_workout_id or "")
-            and str(old_item.get("date") or "")[:10] == target_date
-        )
-        if old_scheduled_id and not same_entry:
-            api.unschedule_workout(old_scheduled_id)
-            source_day = base.parse_date(old_item.get("date"))
-            target_day = base.parse_date(target_date)
-            ok, _ = calendar_consistency.wait_absent(
-                lambda: _sid_present(api, old_scheduled_id, [d for d in (source_day, target_day) if d]),
+    try:
+        if not already:
+            schedule_response = api.schedule_workout(new_workout_id, target_date)
+            ok, value = calendar_consistency.wait_present(
+                lambda: _entry_for(api, new_workout_id, target_date),
                 attempts=8,
             )
-            if not ok:
-                if created_new and isinstance(new_entry, dict) and new_entry.get("scheduled_workout_id"):
-                    try:
-                        api.unschedule_workout(new_entry["scheduled_workout_id"])
-                    except Exception:
-                        pass
-                raise RuntimeError("Garmin viser stadig den gamle kalenderpost efter gentagne read-back-forsøg.")
-            unscheduled = True
+            if not ok or not isinstance(value, dict):
+                raise RuntimeError("Garmin accepterede schedule-kaldet, men det nye pas blev ikke synligt ved gentaget read-back.")
+            new_entry = value
+            created_new = True
 
-    return {
-        "scheduled": created_new,
-        "already_present": bool(already),
-        "schedule_response": schedule_response,
-        "scheduled_workout_id": (new_entry or {}).get("scheduled_workout_id") if isinstance(new_entry, dict) else None,
-        "old_unscheduled": unscheduled,
-    }
+        unscheduled = False
+        if old_item:
+            old_scheduled_id = old_item.get("scheduled_workout_id")
+            same_entry = (
+                str(old_item.get("workout_id") or "") == str(new_workout_id or "")
+                and str(old_item.get("date") or "")[:10] == target_date
+            )
+            if old_scheduled_id and not same_entry:
+                api.unschedule_workout(old_scheduled_id)
+                source_day = base.parse_date(old_item.get("date"))
+                target_day = base.parse_date(target_date)
+                ok, _ = calendar_consistency.wait_absent(
+                    lambda: _sid_present(api, old_scheduled_id, [d for d in (source_day, target_day) if d]),
+                    attempts=8,
+                )
+                if not ok:
+                    raise RuntimeError("Garmin viser stadig den gamle kalenderpost efter gentagne read-back-forsøg.")
+                unscheduled = True
+
+        return {
+            "scheduled": created_new,
+            "already_present": bool(already),
+            "schedule_response": schedule_response,
+            "scheduled_workout_id": (new_entry or {}).get("scheduled_workout_id") if isinstance(new_entry, dict) else None,
+            "old_unscheduled": unscheduled,
+        }
+    except Exception as exc:
+        # calendar is the exact pre-action snapshot passed by calendar_writer.main.
+        detail = rollback_calendar_state(api, calendar, new_workout_id, target_date, old_item)
+        workout_detail = writeback_transaction.rollback(api, new_workout_id)
+        raise RuntimeError(
+            f"{exc} | rollback kalender: {detail[1]} | rollback workout: {workout_detail[1]}"
+        ) from exc
+
+
+def apply_with_rollback(
+    api: Any,
+    calendar: dict[str, Any],
+    action: dict[str, Any],
+    resolved_workout_id: Any | None,
+) -> dict[str, Any]:
+    try:
+        return _ORIGINAL_APPLY(api, calendar, action, resolved_workout_id)
+    except Exception as exc:
+        if resolved_workout_id is not None and writeback_transaction.pending(resolved_workout_id):
+            detail = rollback_everything(api, calendar, action, resolved_workout_id)
+            raise RuntimeError(f"{exc} | {detail}") from exc
+        raise
 
 
 def verify_with_retry(
@@ -146,7 +261,12 @@ def verify_with_retry(
         attempts=8,
     )
     if ok and isinstance(value, tuple):
+        writeback_transaction.commit(resolved_workout_id)
         return value
+
+    if resolved_workout_id is not None and writeback_transaction.pending(resolved_workout_id):
+        rollback_detail = rollback_everything(api, original_calendar, action, resolved_workout_id)
+        return False, f"{last[1]} | {rollback_detail}", last[2]
     return last
 
 
@@ -196,12 +316,10 @@ def actionable_with_safe_test_fallback(preview: dict[str, Any], allow_remove: bo
 
 base.fresh_calendar = full_window_calendar
 base.schedule_then_unschedule = transactional_schedule_then_unschedule
+base.apply_action = apply_with_rollback
 base.verify_action = verify_with_retry
 base.actionable = actionable_with_safe_test_fallback
-# Expert-generated running specs are compiled and read-back verified here. This
-# replacement preserves the old named-master path for strength and actions without
-# session_spec, and keeps MOVE semantics safe for coach-owned generated workouts.
-base.resolve_target_workout = planned_workout_compiler.resolve_for_action
+base.resolve_target_workout = writeback_transaction.resolve
 
 if __name__ == "__main__":
     raise SystemExit(base.main())
