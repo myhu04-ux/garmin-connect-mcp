@@ -1,3 +1,18 @@
+import base64
+import datetime
+import logging
+import os
+import sys
+
+import anyio
+import uvicorn
+from garminconnect import Garmin, GarminConnectAuthenticationError  # <--- DENNE SKAL VÆRE HER
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.fastmcp import FastMCP
+from pydantic import AnyHttpUrl
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 def init_api() -> Garmin:
     """Initialize Garmin client using the official Personal API Key."""
     api_key = os.getenv("GARMIN_PERSONAL_API_KEY")
